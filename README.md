@@ -65,6 +65,9 @@ never stored or refreshed by claudemon.
 - **APISTAT** - `v` switches LIMITS (live limits) and MODELS (tokens per day
   per model; `d` cycles all time / 7 days / 30 days; `ctrl+s` copies the
   table).
+- **COST** - API-equivalent cost at list prices by day, model, and project
+  (`d` cycles dates). Prices are in `~/.claudemon/config.json` under
+  `pricing` (USD per million tokens) and can be edited.
 - **ACTIVITY** - per-project activity heatmaps.
 - **HISTORY** - sessions grouped by project, with titles, token usage, and
   the `claude --resume` command.

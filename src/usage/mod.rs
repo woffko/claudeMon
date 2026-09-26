@@ -20,7 +20,7 @@ const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
 // v14: each session has one immutable owner cwd. Derived cache rows from
 // earlier schemas can contain mutable-context or git-collapsed attribution.
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 2;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 4;
 pub(crate) const PROJECT_IDENTITY_LINE_LIMIT: usize = 128;
 const MAX_OWNER_IDENTITY_LINE_BYTES: usize = 512 * 1024;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
@@ -271,6 +271,10 @@ pub struct LocalUsageSnapshot {
     /// model first.
     pub model_daily: Vec<ModelDailyUsage>,
     pub utc_model_daily: Vec<ModelDailyUsage>,
+    /// Per-project, per-model daily usage (projects sorted by path).
+    pub project_model_daily: Vec<ProjectModelDaily>,
+    pub utc_project_model_daily: Vec<ProjectModelDaily>,
+    pub reported_costs: ReportedCosts,
     pub project_activity: Vec<ProjectActivity>,
     pub project_usage: Vec<ProjectUsageSummary>,
     // Number of session files that were identified as belonging to the selected workspace filter.
@@ -306,6 +310,13 @@ impl LocalUsageSnapshot {
         match zone {
             UsageZone::Local => &self.days,
             UsageZone::Utc => &self.utc_days,
+        }
+    }
+
+    pub fn project_model_daily_for_zone(&self, zone: UsageZone) -> &[ProjectModelDaily] {
+        match zone {
+            UsageZone::Local => &self.project_model_daily,
+            UsageZone::Utc => &self.utc_project_model_daily,
         }
     }
 
@@ -506,6 +517,10 @@ pub struct TokenBreakdown {
     pub input: i64,
     #[serde(default)]
     pub cache_write: i64,
+    /// Part of `cache_write` written with the one-hour TTL (billed higher
+    /// than five-minute writes).
+    #[serde(default)]
+    pub cache_write_1h: i64,
     #[serde(default)]
     pub cache_read: i64,
     #[serde(default)]
@@ -523,9 +538,26 @@ impl TokenBreakdown {
     pub fn add(&mut self, other: TokenBreakdown) {
         self.input = self.input.saturating_add(other.input);
         self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.cache_write_1h = self.cache_write_1h.saturating_add(other.cache_write_1h);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.output = self.output.saturating_add(other.output);
     }
+}
+
+/// Per-model daily usage of one project (session owner).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectModelDaily {
+    pub project: String,
+    pub models: Vec<ModelDailyUsage>,
+}
+
+/// Costs Claude Code recorded itself (`cost-state` records), with the
+/// transcript tokens of the same sessions for comparison.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReportedCosts {
+    pub sessions: usize,
+    pub reported_usd: f64,
+    pub tokens_by_model: BTreeMap<String, TokenBreakdown>,
 }
 
 /// Daily token usage of one model, keyed by `YYYY-MM-DD`.
@@ -566,6 +598,13 @@ struct ParserState {
     /// `turn_duration` record replaces the estimate with the exact duration.
     #[serde(default)]
     turn_estimate_ms: i64,
+    /// Latest `cost-state.totalCostUSD` Claude Code recorded for the session.
+    #[serde(default)]
+    reported_cost_usd: Option<f64>,
+    /// Transcript tokens per model up to that record, so the comparison
+    /// ignores usage written after it.
+    #[serde(default)]
+    reported_tokens: BTreeMap<String, TokenBreakdown>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -705,7 +744,7 @@ pub fn compute_snapshot(
             activity_day_keys,
             project_activity,
             Vec::new(),
-            (Vec::new(), Vec::new()),
+            ModelBreakdowns::default(),
             0,
             0,
             0,
@@ -1175,7 +1214,7 @@ fn build_snapshot(
     activity_day_keys: Vec<String>,
     project_activity: HashMap<String, ProjectActivityBuilder>,
     project_usage: Vec<ProjectUsageSummary>,
-    model_daily: (Vec<ModelDailyUsage>, Vec<ModelDailyUsage>),
+    model_daily: ModelBreakdowns,
     scan_total_files: usize,
     scan_indexed_files: usize,
     scan_pending_files: usize,
@@ -1193,8 +1232,11 @@ fn build_snapshot(
         utc_totals,
         utc_top_models,
         activity_first_weekday,
-        model_daily: model_daily.0,
-        utc_model_daily: model_daily.1,
+        model_daily: model_daily.local,
+        utc_model_daily: model_daily.utc,
+        project_model_daily: model_daily.local_projects,
+        utc_project_model_daily: model_daily.utc_projects,
+        reported_costs: model_daily.reported_costs,
         project_activity: build_project_activity(activity_day_keys, project_activity),
         project_usage,
         matched_session_files,
@@ -1335,30 +1377,59 @@ fn build_project_usage_summaries(
     out
 }
 
-/// Per-model daily usage (local and UTC) from cache rows, honoring the
-/// workspace filter.
+/// Per-model breakdowns derived from cache rows after a scan.
+#[derive(Debug, Default)]
+struct ModelBreakdowns {
+    local: Vec<ModelDailyUsage>,
+    utc: Vec<ModelDailyUsage>,
+    local_projects: Vec<ProjectModelDaily>,
+    utc_projects: Vec<ProjectModelDaily>,
+    reported_costs: ReportedCosts,
+}
+
+type ModelDays = HashMap<String, BTreeMap<String, TokenBreakdown>>;
+
+/// Per-model daily usage (overall and per project, local and UTC) and the
+/// Claude Code cost records from cache rows, honoring the workspace filter.
 fn build_model_daily<'a>(
     entries: impl Iterator<Item = &'a CachedFileScanEntry>,
     workspace_path: Option<&Path>,
-) -> (Vec<ModelDailyUsage>, Vec<ModelDailyUsage>) {
-    let mut local: HashMap<String, BTreeMap<String, TokenBreakdown>> = HashMap::new();
-    let mut utc: HashMap<String, BTreeMap<String, TokenBreakdown>> = HashMap::new();
+) -> ModelBreakdowns {
+    let mut local: ModelDays = HashMap::new();
+    let mut utc: ModelDays = HashMap::new();
+    let mut local_projects: BTreeMap<String, ModelDays> = BTreeMap::new();
+    let mut utc_projects: BTreeMap<String, ModelDays> = BTreeMap::new();
+    let mut reported_costs = ReportedCosts::default();
     for entry in entries {
+        let projects = entry_project_paths(entry);
         if let Some(filter) = workspace_path {
-            if !entry_project_paths(entry)
+            if !projects
                 .iter()
                 .any(|project| path_matches_workspace(project, filter))
             {
                 continue;
             }
         }
+        let project = projects.into_iter().next();
+        let reported = entry.parser_state.reported_cost_usd;
+        if let Some(cost) = reported {
+            reported_costs.sessions += 1;
+            reported_costs.reported_usd += cost;
+            for (model, tokens) in &entry.parser_state.reported_tokens {
+                reported_costs
+                    .tokens_by_model
+                    .entry(model.clone())
+                    .or_default()
+                    .add(*tokens);
+            }
+        }
         for (cache_key, models) in &entry.model_totals_by_day {
             let Some((zone, day)) = split_cache_day_key(cache_key) else {
                 continue;
             };
-            let target = match zone {
-                UsageZone::Local => &mut local,
-                UsageZone::Utc => &mut utc,
+            let (target, project_target) = match zone {
+                UsageZone::Local => (&mut local, &mut local_projects),
+                UsageZone::Utc => (&mut utc, &mut utc_projects),
             };
             for (model, tokens) in models {
                 if model == "unknown" {
@@ -1370,10 +1441,20 @@ fn build_model_daily<'a>(
                     .entry(day.to_string())
                     .or_default()
                     .add(*tokens);
+                if let Some(project) = project.as_ref() {
+                    project_target
+                        .entry(project.clone())
+                        .or_default()
+                        .entry(model.clone())
+                        .or_default()
+                        .entry(day.to_string())
+                        .or_default()
+                        .add(*tokens);
+                }
             }
         }
     }
-    let finish = |map: HashMap<String, BTreeMap<String, TokenBreakdown>>| {
+    let finish = |map: ModelDays| {
         let mut out: Vec<ModelDailyUsage> = map
             .into_iter()
             .map(|(model, days)| ModelDailyUsage { model, days })
@@ -1387,7 +1468,21 @@ fn build_model_daily<'a>(
         });
         out
     };
-    (finish(local), finish(utc))
+    let finish_projects = |map: BTreeMap<String, ModelDays>| {
+        map.into_iter()
+            .map(|(project, models)| ProjectModelDaily {
+                project,
+                models: finish(models),
+            })
+            .collect::<Vec<_>>()
+    };
+    ModelBreakdowns {
+        local: finish(local),
+        utc: finish(utc),
+        local_projects: finish_projects(local_projects),
+        utc_projects: finish_projects(utc_projects),
+        reported_costs,
+    }
 }
 
 fn entry_project_paths(entry: &CachedFileScanEntry) -> Vec<String> {
@@ -1681,6 +1776,18 @@ fn parse_file_summary(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if value.get("type").and_then(Value::as_str) == Some("cost-state") {
+            // Cumulative session cost; the record carries no timestamp.
+            if let Some(cost) = value
+                .get("totalCostUSD")
+                .and_then(Value::as_f64)
+                .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            {
+                state.reported_cost_usd = Some(cost);
+                state.reported_tokens = cumulative_model_tokens(&model_totals_by_day);
+            }
+            continue;
+        }
         let Some(timestamp_ms) = read_timestamp_ms(&value) else {
             continue;
         };
@@ -1741,6 +1848,22 @@ fn parse_file_summary(
     })
 }
 
+/// Per-model token totals parsed so far (one zone, so each record counts once).
+fn cumulative_model_tokens(
+    model_totals_by_day: &HashMap<String, HashMap<String, TokenBreakdown>>,
+) -> BTreeMap<String, TokenBreakdown> {
+    let mut totals: BTreeMap<String, TokenBreakdown> = BTreeMap::new();
+    for (cache_key, models) in model_totals_by_day {
+        if !matches!(split_cache_day_key(cache_key), Some((UsageZone::Utc, _))) {
+            continue;
+        }
+        for (model, tokens) in models {
+            totals.entry(model.clone()).or_default().add(*tokens);
+        }
+    }
+    totals
+}
+
 /// Returns the dedupe key, model, and usage of an `assistant` record.
 fn extract_assistant_usage(value: &Value) -> Option<(String, String, TokenBreakdown)> {
     let message = value.get("message")?.as_object()?;
@@ -1759,9 +1882,17 @@ fn extract_assistant_usage(value: &Value) -> Option<(String, String, TokenBreakd
             .unwrap_or(0)
             .max(0)
     };
+    let cache_write = read("cache_creation_input_tokens");
+    let cache_write_1h = usage
+        .get("cache_creation")
+        .and_then(|split| split.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .clamp(0, cache_write);
     let tokens = TokenBreakdown {
         input: read("input_tokens"),
-        cache_write: read("cache_creation_input_tokens"),
+        cache_write,
+        cache_write_1h,
         cache_read: read("cache_read_input_tokens"),
         output: read("output_tokens"),
     };
@@ -3761,11 +3892,52 @@ mod tests {
             TokenBreakdown {
                 input: 11,
                 cache_write: 22,
+                cache_write_1h: 0,
                 cache_read: 33,
                 output: 44,
             }
         );
         assert_eq!(models[0].total_since(Some("9999-01-01")).total(), 0);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cost_state_and_one_hour_cache_writes_are_recorded() {
+        let root = make_temp_dir("cost-state");
+        let (claude_dir, sessions_root) = make_claude_dir(&root);
+        let path = sessions_root.join("session.jsonl");
+        let now_ms = Utc::now().timestamp_millis();
+        let mut line = assistant_line(now_ms, TEST_PROJECT_CWD, "msg-1", [1, 100, 0, 1]);
+        line["message"]["usage"]["cache_creation"] =
+            serde_json::json!({"ephemeral_5m_input_tokens": 40, "ephemeral_1h_input_tokens": 60});
+        append_json_line(&path, line);
+        append_json_line(
+            &path,
+            serde_json::json!({"type": "cost-state", "sessionId": "s", "totalCostUSD": 1.5}),
+        );
+        append_json_line(
+            &path,
+            serde_json::json!({"type": "cost-state", "sessionId": "s", "totalCostUSD": 2.25}),
+        );
+        // Usage after the last cost record is not part of the comparison.
+        append_usage_line(&path, now_ms + 1, TEST_PROJECT_CWD, [0, 50, 0, 0]);
+
+        let snapshot = compute_snapshot(30, &claude_dir, None, default_test_limits(false), None)
+            .expect("snapshot");
+        let models = snapshot.model_daily_for_zone(UsageZone::Utc);
+        assert_eq!(models[0].total_since(None).cache_write_1h, 60);
+        assert_eq!(models[0].total_since(None).cache_write, 150);
+        assert_eq!(snapshot.reported_costs.sessions, 1);
+        assert_eq!(snapshot.reported_costs.reported_usd, 2.25);
+        assert_eq!(
+            snapshot.reported_costs.tokens_by_model["claude-test-1"].cache_write,
+            100
+        );
+        let projects = snapshot.project_model_daily_for_zone(UsageZone::Local);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project, TEST_PROJECT_CWD);
+        assert_eq!(projects[0].models[0].total_since(None).total(), 152);
 
         let _ = std::fs::remove_dir_all(root);
     }

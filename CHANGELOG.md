@@ -36,3 +36,6 @@ All notable changes to this project are documented in this file.
   usage, usage by surface) and a MODELS view (tokens per day per model,
   date ranges, per-model cards, copy to clipboard).
 - Removed the Codex limit-reset screen and reset button.
+- COST screen: API-equivalent cost at list prices by day, model, and
+  project, with Claude Code's recorded session costs as a cross-check.
+  Prices live in `config.json` (`pricing`, `pricing_updated`).

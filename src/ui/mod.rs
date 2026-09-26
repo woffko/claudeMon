@@ -1,4 +1,5 @@
 pub(crate) mod apistat;
+pub(crate) mod cost;
 
 use crate::app::{
     AccentTheme, ActiveScreen, AppState, BarFillMode, ChartOrientation, UiClickAction, UiHitTarget,
@@ -268,6 +269,18 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
                 render_help_overlay(frame, area, state.active_screen);
             }
         }
+        ActiveScreen::Cost => {
+            let footer_height = footer_height(inner.width, state);
+            let chunks = usage_screen_layout(inner, footer_height);
+
+            cost::render_header(frame, chunks[0], state);
+            cost::render(frame, chunks[1], state);
+            render_footer(frame, chunks[2], state);
+
+            if state.show_help {
+                render_help_overlay(frame, area, state.active_screen);
+            }
+        }
         ActiveScreen::Read => {
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
@@ -327,6 +340,7 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             " APISTAT ",
             Some(UiClickAction::SetScreen(ActiveScreen::ApiStat)),
         ),
+        (" COST ", Some(UiClickAction::SetScreen(ActiveScreen::Cost))),
         (
             " ACTIVITY ",
             Some(UiClickAction::SetScreen(ActiveScreen::Activity)),
@@ -353,6 +367,7 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
         Span::raw(" "),
         pill("USAGE", active_screen == ActiveScreen::Usage),
         pill("APISTAT", active_screen == ActiveScreen::ApiStat),
+        pill("COST", active_screen == ActiveScreen::Cost),
         pill("ACTIVITY", active_screen == ActiveScreen::Activity),
         pill("HISTORY", active_screen == ActiveScreen::Read),
     ]);
@@ -701,6 +716,9 @@ fn footer_hint(screen: ActiveScreen) -> &'static str {
         ActiveScreen::ApiStat => {
             "APISTAT: View [v/tab] (limits/models), Dates [d] (all/7d/30d), Copy models [ctrl+s], Refresh limits [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
+        ActiveScreen::Cost => {
+            "Cost: Dates [d] (all/7d/30d), Zone [z on USAGE], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+        }
         ActiveScreen::Read => "",
     }
 }
@@ -713,6 +731,7 @@ fn footer_error(state: &AppState) -> String {
             .or(state.limits_error.as_deref()),
         ActiveScreen::Activity => state.usage_error.as_deref(),
         ActiveScreen::ApiStat => state.limits_error.as_deref(),
+        ActiveScreen::Cost => state.usage_error.as_deref(),
         ActiveScreen::Read => None,
     }
     .unwrap_or("");
@@ -3862,6 +3881,17 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  ?    - toggle help"),
             Line::from("  q    - quit (confirm)"),
         ]),
+        ActiveScreen::Cost => Text::from(vec![
+            Line::from("Keys:"),
+            Line::from("  d    - cycle dates (all / 7 days / 30 days)"),
+            Line::from("  r/F5 - refresh usage"),
+            Line::from("  Prices: `pricing` in config.json (USD per million tokens)"),
+            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  c    - cycle color theme"),
+            Line::from("  s/F2 - switch screen"),
+            Line::from("  ?    - toggle help"),
+            Line::from("  q    - quit (confirm)"),
+        ]),
         ActiveScreen::Read => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
@@ -5350,26 +5380,31 @@ mod tests {
     fn navigation_tabs_are_clickable_on_the_outer_border() {
         let (title, targets) = navigation_title(Rect::new(4, 2, 80, 20), ActiveScreen::Activity);
 
-        assert_eq!(title.width(), 36);
-        assert_eq!(targets.len(), 4);
-        assert_eq!(targets[0].area, Rect::new(48, 2, 7, 1));
+        assert_eq!(title.width(), 42);
+        assert_eq!(targets.len(), 5);
+        assert_eq!(targets[0].area, Rect::new(42, 2, 7, 1));
         assert_eq!(
             targets[0].action,
             UiClickAction::SetScreen(ActiveScreen::Usage)
         );
-        assert_eq!(targets[1].area, Rect::new(55, 2, 9, 1));
+        assert_eq!(targets[1].area, Rect::new(49, 2, 9, 1));
         assert_eq!(
             targets[1].action,
             UiClickAction::SetScreen(ActiveScreen::ApiStat)
         );
-        assert_eq!(targets[2].area, Rect::new(64, 2, 10, 1));
+        assert_eq!(targets[2].area, Rect::new(58, 2, 6, 1));
         assert_eq!(
             targets[2].action,
-            UiClickAction::SetScreen(ActiveScreen::Activity)
+            UiClickAction::SetScreen(ActiveScreen::Cost)
         );
-        assert_eq!(targets[3].area, Rect::new(74, 2, 9, 1));
+        assert_eq!(targets[3].area, Rect::new(64, 2, 10, 1));
         assert_eq!(
             targets[3].action,
+            UiClickAction::SetScreen(ActiveScreen::Activity)
+        );
+        assert_eq!(targets[4].area, Rect::new(74, 2, 9, 1));
+        assert_eq!(
+            targets[4].action,
             UiClickAction::SetScreen(ActiveScreen::Read)
         );
     }
@@ -5382,8 +5417,8 @@ mod tests {
         );
         let (navigation, targets) =
             navigation_title(Rect::new(0, 0, 80, 24), ActiveScreen::ApiStat);
-        assert_eq!(navigation.width(), 36);
-        assert_eq!(targets.len(), 4);
+        assert_eq!(navigation.width(), 42);
+        assert_eq!(targets.len(), 5);
     }
 
     #[test]
@@ -6279,7 +6314,7 @@ mod tests {
         );
     }
 
-    fn test_usage_snapshot() -> crate::usage::LocalUsageSnapshot {
+    pub(crate) fn test_usage_snapshot() -> crate::usage::LocalUsageSnapshot {
         let totals = crate::usage::UsageTotalsTokens {
             last7_days_tokens: 0,
             last30_days_tokens: 0,
@@ -6298,6 +6333,9 @@ mod tests {
             activity_first_weekday: Weekday::Mon,
             model_daily: Vec::new(),
             utc_model_daily: Vec::new(),
+            project_model_daily: Vec::new(),
+            utc_project_model_daily: Vec::new(),
+            reported_costs: crate::usage::ReportedCosts::default(),
             project_activity: Vec::new(),
             project_usage: Vec::new(),
             matched_session_files: 0,
@@ -6316,6 +6354,7 @@ mod tests {
         let tokens = |input, cache_write, cache_read, output| crate::usage::TokenBreakdown {
             input,
             cache_write,
+            cache_write_1h: 0,
             cache_read,
             output,
         };

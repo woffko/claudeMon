@@ -283,16 +283,24 @@ Sub-views, switched with a small tab row (like Claude Code `/stats`):
       exists, errors kept next to the last good data, stale status-line
       snapshots (> 15 min) flagged, expired windows shown without a value.
 
-### Phase 5 - COST (1-2 days)
+### Phase 5 - COST (done)
 
-- [ ] Pricing table in `config.json` (per model: input, cache write 5m,
-      cache write 1h, cache read, output), seeded with current published
-      rates and a `pricing_updated` date; unknown models flagged.
-- [ ] Per day / per model / per project cost from local rows, with
-      `cost-state.totalCostUSD` as a per-session cross-check.
-- [ ] When S3 is configured, show server cost next to the local estimate.
-- [ ] Clear labeling: subscription users see "API-equivalent cost", not a
-      bill.
+- [x] Pricing table in `config.json` (`pricing`: per model input, output,
+      cache write 5m, cache write 1h, cache read in USD per million tokens)
+      seeded with the published rates, `pricing_updated` date; model ids
+      match exactly, without a date suffix, or by longest family prefix;
+      unknown models are listed as unpriced. Validated against Claude
+      Code's own `cost-state` records to the cent (Opus 5.5 with 1-hour
+      cache writes, Haiku 4.5 with 5-minute writes), which required
+      tracking the 1-hour share of cache writes (cache schema v4).
+- [x] Per day / per model (input, cache write, cache read, output) / per
+      project cost for all time, 7, or 30 days, with Claude Code's recorded
+      session costs compared against the same transcripts priced up to the
+      record (usage after the last record is excluded).
+- [ ] Optional (depends on the optional S3 source): show server cost next
+      to the local estimate.
+- [x] Clear labeling: "API-equivalent at list prices", the price table
+      date, and that subscription usage is not billed per token.
 
 ### Phase 6 - UI polish (1-2 days)
 

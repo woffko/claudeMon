@@ -425,7 +425,11 @@ struct ModelRangeUsage<'a> {
 }
 
 /// Day keys (`YYYY-MM-DD`) of the selected range, oldest first.
-fn range_days(snapshot: &LocalUsageSnapshot, zone: UsageZone, range: ModelsRange) -> Vec<String> {
+pub(super) fn range_days(
+    snapshot: &LocalUsageSnapshot,
+    zone: UsageZone,
+    range: ModelsRange,
+) -> Vec<String> {
     let days = snapshot.days_for_zone(zone);
     let Some(last) = days
         .last()

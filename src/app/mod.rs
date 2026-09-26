@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub live_limits_mode: LiveLimitsMode,
+    pub pricing: crate::pricing::PriceTable,
     pub claudemon_home: std::path::PathBuf,
     pub claude_dir: std::path::PathBuf,
     pub read_sessions_dir: std::path::PathBuf,
@@ -321,6 +322,7 @@ pub(crate) enum ActiveScreen {
     Usage,
     Activity,
     ApiStat,
+    Cost,
     Read,
 }
 
@@ -342,6 +344,7 @@ pub(crate) enum UiClickAction {
     SetOrientation(ChartOrientation),
     SetApiStatView(ApiStatView),
     SetModelsRange(ModelsRange),
+    SetCostRange(ModelsRange),
     CopyModelsTable,
     ScrollUsageOlder,
     ScrollUsageNewer,
@@ -407,6 +410,13 @@ enum ActivityCommand {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum CostCommand {
+    Refresh,
+    CycleRange,
+    ToggleHelp,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum ApiStatCommand {
     Refresh,
     ToggleView,
@@ -418,7 +428,8 @@ enum ApiStatCommand {
 fn next_active_screen(screen: ActiveScreen) -> ActiveScreen {
     match screen {
         ActiveScreen::Usage => ActiveScreen::ApiStat,
-        ActiveScreen::ApiStat => ActiveScreen::Activity,
+        ActiveScreen::ApiStat => ActiveScreen::Cost,
+        ActiveScreen::Cost => ActiveScreen::Activity,
         ActiveScreen::Activity => ActiveScreen::Read,
         ActiveScreen::Read => ActiveScreen::Usage,
     }
@@ -433,6 +444,8 @@ pub(crate) struct AppState {
     pub(crate) orientation: ChartOrientation,
     pub(crate) api_stat_view: ApiStatView,
     pub(crate) models_range: ModelsRange,
+    pub(crate) cost_range: ModelsRange,
+    pub(crate) pricing: crate::pricing::PriceTable,
     pub(crate) usage_period_offset: usize,
     pub(crate) usage_visible_periods: usize,
     pub(crate) usage_total_periods: usize,
@@ -496,6 +509,7 @@ struct PersistedUiState {
     orientation: ChartOrientation,
     api_stat_view: ApiStatView,
     models_range: ModelsRange,
+    cost_range: ModelsRange,
     activity_project_limit: usize,
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
@@ -519,6 +533,7 @@ impl PersistedUiState {
             orientation: ChartOrientation::Horizontal,
             api_stat_view: ApiStatView::Overview,
             models_range: ModelsRange::Last30Days,
+            cost_range: ModelsRange::Last30Days,
             activity_project_limit: DEFAULT_ACTIVITY_PROJECT_LIMIT,
             workspace_path,
             no_sessions_confirm_dismissed: false,
@@ -542,6 +557,7 @@ impl PersistedUiState {
             orientation: state.orientation,
             api_stat_view: state.api_stat_view,
             models_range: state.models_range,
+            cost_range: state.cost_range,
             activity_project_limit: state.activity_project_limit,
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
@@ -588,6 +604,7 @@ struct StoredGlobalState {
     orientation: Option<String>,
     api_stat_view: Option<String>,
     models_range: Option<String>,
+    cost_range: Option<String>,
     activity_project_limit: Option<usize>,
     display_style: Option<String>,
     accent_theme: Option<String>,
@@ -956,6 +973,8 @@ async fn run_inner(
         orientation: restored_ui_state.orientation,
         api_stat_view: restored_ui_state.api_stat_view,
         models_range: restored_ui_state.models_range,
+        cost_range: restored_ui_state.cost_range,
+        pricing: config.pricing.clone(),
         usage_period_offset: 0,
         usage_visible_periods: 0,
         usage_total_periods: 0,
@@ -1412,6 +1431,13 @@ fn handle_input_event(
             let dirty = handle_api_stat_command(state, command, limits_refresh_tx);
             Ok(InputOutcome::Continue(dirty))
         }
+        ActiveScreen::Cost => {
+            let Some(command) = map_event_to_cost_cmd(event) else {
+                return Ok(InputOutcome::Continue(false));
+            };
+            let dirty = handle_cost_command(state, command, usage_refresh_tx);
+            Ok(InputOutcome::Continue(dirty))
+        }
         ActiveScreen::Read => Ok(InputOutcome::Continue(read::tui::handle_event(
             &mut state.read_browser,
             event,
@@ -1535,6 +1561,11 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             state.api_stat_notice = None;
             let changed = state.models_range != range;
             state.models_range = range;
+            changed
+        }
+        UiClickAction::SetCostRange(range) => {
+            let changed = state.cost_range != range;
+            state.cost_range = range;
             changed
         }
         UiClickAction::CopyModelsTable => {
@@ -1681,6 +1712,39 @@ fn map_event_to_activity_cmd(event: Event) -> Option<ActivityCommand> {
             }
         }
         _ => None,
+    }
+}
+
+fn map_event_to_cost_cmd(event: Event) -> Option<CostCommand> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Char('r') | KeyCode::F(5) => Some(CostCommand::Refresh),
+            KeyCode::Char('d') | KeyCode::Char('D') => Some(CostCommand::CycleRange),
+            KeyCode::Char('?') => Some(CostCommand::ToggleHelp),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn handle_cost_command(
+    state: &mut AppState,
+    cmd: CostCommand,
+    usage_refresh_tx: &mpsc::Sender<()>,
+) -> bool {
+    match cmd {
+        CostCommand::Refresh => {
+            let _ = usage_refresh_tx.try_send(());
+            true
+        }
+        CostCommand::CycleRange => {
+            state.cost_range = state.cost_range.cycled();
+            true
+        }
+        CostCommand::ToggleHelp => {
+            state.show_help = !state.show_help;
+            true
+        }
     }
 }
 
@@ -2108,6 +2172,14 @@ fn load_persisted_ui_state_with_history_depth(
     {
         state.models_range = range;
     }
+    if let Some(range) = store
+        .global
+        .cost_range
+        .as_deref()
+        .and_then(ModelsRange::from_store)
+    {
+        state.cost_range = range;
+    }
     if let Some(limit) = store.global.activity_project_limit {
         state.activity_project_limit =
             limit.clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT);
@@ -2179,6 +2251,7 @@ fn save_persisted_ui_state(claudemon_home: &Path, state: &PersistedUiState) -> R
     store.global.orientation = Some(chart_orientation_to_store(state.orientation).to_string());
     store.global.api_stat_view = Some(state.api_stat_view.store_value().to_string());
     store.global.models_range = Some(state.models_range.store_value().to_string());
+    store.global.cost_range = Some(state.cost_range.store_value().to_string());
     store.global.activity_project_limit = Some(
         state
             .activity_project_limit
@@ -2532,6 +2605,10 @@ mod tests {
         );
         assert_eq!(
             next_active_screen(ActiveScreen::ApiStat),
+            ActiveScreen::Cost
+        );
+        assert_eq!(
+            next_active_screen(ActiveScreen::Cost),
             ActiveScreen::Activity
         );
         assert_eq!(
@@ -2653,12 +2730,14 @@ mod tests {
         let mut state = PersistedUiState::default_for_workspace(None);
         state.api_stat_view = ApiStatView::Models;
         state.models_range = ModelsRange::AllTime;
+        state.cost_range = ModelsRange::Last7Days;
 
         save_persisted_ui_state(&claudemon_home, &state).expect("save persisted ui state");
         let loaded =
             load_persisted_ui_state(&claudemon_home, None).expect("load persisted ui state");
         assert_eq!(loaded.api_stat_view, ApiStatView::Models);
         assert_eq!(loaded.models_range, ModelsRange::AllTime);
+        assert_eq!(loaded.cost_range, ModelsRange::Last7Days);
 
         let _ = std::fs::remove_dir_all(claudemon_home);
     }

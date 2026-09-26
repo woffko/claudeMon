@@ -1,6 +1,7 @@
 mod app;
 mod limits;
 mod locale;
+mod pricing;
 mod read;
 mod storage;
 mod ui;
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 
-const USER_CONFIG_SCHEMA_VERSION: u32 = 3;
+const USER_CONFIG_SCHEMA_VERSION: u32 = 4;
 const USER_CONFIG_FILE_NAME: &str = "config.json";
 const DEFAULT_USAGE_DAYS: u32 = 30;
 const DEFAULT_REFRESH_USAGE_SECS: u64 = 300;
@@ -46,6 +47,10 @@ struct UserConfig {
     history_catalog_scan_budget_ms: u64,
     /// Live limit source: "statusline" (default), "oauth", or "off".
     live_limits: LiveLimitsArg,
+    /// API list prices in USD per million tokens, used by the COST screen.
+    pricing: std::collections::BTreeMap<String, pricing::ModelPrice>,
+    /// Date the price table was last reviewed.
+    pricing_updated: String,
 }
 
 impl Default for UserConfig {
@@ -70,6 +75,8 @@ impl Default for UserConfig {
             history_catalog_max_candidates: DEFAULT_HISTORY_CATALOG_MAX_CANDIDATES,
             history_catalog_scan_budget_ms: DEFAULT_HISTORY_CATALOG_SCAN_BUDGET_MS,
             live_limits: LiveLimitsArg::Statusline,
+            pricing: pricing::default_prices(),
+            pricing_updated: pricing::DEFAULT_PRICING_UPDATED.to_string(),
         }
     }
 }
@@ -388,6 +395,10 @@ async fn main() -> Result<()> {
 
     let config = app::Config {
         live_limits_mode: args.live_limits.unwrap_or(user_config.live_limits).into(),
+        pricing: pricing::PriceTable {
+            prices: user_config.pricing.clone(),
+            updated: user_config.pricing_updated.clone(),
+        },
         claudemon_home,
         claude_dir,
         read_sessions_dir: read_config.sessions_dir,
