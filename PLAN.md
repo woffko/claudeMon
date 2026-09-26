@@ -210,27 +210,33 @@ Sub-views, switched with a small tab row (like Claude Code `/stats`):
 - [x] `cargo check`, `cargo test` (167 passed), `scripts/check-ascii.sh` pass.
 - [ ] First commit.
 
-### Phase 2 - USAGE from Claude Code logs (3-4 days)
+### Phase 2 - USAGE from Claude Code logs (done)
 
-Main work is in `src/usage/mod.rs` (5.6k lines) and `src/read/scan.rs`.
-
-- [ ] Discovery: `projects/*/*.jsonl` plus `projects/*/*/subagents/*.jsonl`.
-- [ ] Parser for `assistant` records with dedupe by
-      `(message.id, requestId)`. Duplicates can straddle an incremental-scan
-      boundary, so store per-request rows keyed by that pair (upsert) and
-      aggregate in SQL.
-- [ ] Attribution: project = record `cwd`; subagent usage counts toward the
-      parent session (flag kept for a later filter).
-- [ ] Four token columns (section 2) in chart, cards, and cache schema.
-- [ ] Runs = user prompts (`user` records with a `promptId` that are not
-      tool results). Time = turn spans, idle-capped as in CoMon.
-- [ ] Model names: `claude-opus-5-5` -> "Opus 5.5" etc.; families
-      (Opus / Sonnet / Haiku / Fable / other) get stable colors.
-- [ ] New cache schema v1 (no migration from CoMon caches).
-- [ ] Config `exclude_project_globs` (for example `/tmp/<agent-wrapper>-*`
-      wrapper sessions).
-- [ ] Cross-check tests: fixture totals vs `cost-state.modelUsage`; manual
-      check vs `stats-cache.json`.
+- [x] Discovery: every `*.jsonl` under `<claude-dir>/projects`, including
+      `<session>/subagents/*.jsonl`.
+- [x] Parser for `assistant` records with dedupe by
+      `(message.id, requestId)`. Verified on real logs: duplicate lines
+      carry identical usage and are always contiguous, so the last key is
+      persisted in the parser state and survives incremental resume.
+- [x] Unterminated last line (record still being written) is left for the
+      next refresh instead of being consumed.
+- [x] Attribution: project = cwd of the first record (launch directory);
+      later `cd` in tool calls never re-homes a session.
+- [x] Four token columns (section 2) in chart, cards, and cache.
+      Cache hit rate = cache reads / (input + cache writes + cache reads).
+- [x] Runs = distinct `promptId` (one per turn, including background task
+      notifications). Time = gap estimate per turn, corrected to the exact
+      `system/turn_duration.durationMs` when the turn records it.
+- [x] Model names: `claude-opus-5-5` -> "Opus 5.5".
+- [x] Fresh cache schema v1; any schema mismatch rebuilds rows.
+- [x] Claude Code deletes transcripts after `cleanupPeriodDays` (30 by
+      default): cache rows of deleted transcripts are kept and still
+      counted, so claudemon history outlives the raw logs.
+- [x] Cross-check against an independent Python reference on real logs:
+      runs identical, tokens within the live-session growth between runs.
+- [ ] Config `exclude_project_globs` (for example `/tmp/<agent-wrapper>-*`).
+- [ ] Optional import of `stats-cache.json` history older than the oldest
+      transcript (per-model daily tokens only).
 
 ### Phase 3 - Session history (2 days)
 

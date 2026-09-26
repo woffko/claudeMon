@@ -131,13 +131,14 @@ pub fn format_updated_label(updated_at: Instant) -> String {
     }
 }
 
+/// Cache hit rate: cache reads as a share of all prompt-side tokens.
 fn cache_hit_rate_label(
-    input_tokens: i64,
-    cached_input_tokens: i64,
+    prompt_tokens: i64,
+    cache_read_tokens: i64,
     formatter: DisplayFormatter<'_>,
 ) -> String {
-    let rate = if input_tokens > 0 {
-        ((cached_input_tokens as f64) / (input_tokens as f64) * 1000.0).round() / 10.0
+    let rate = if prompt_tokens > 0 {
+        ((cache_read_tokens as f64) / (prompt_tokens as f64) * 1000.0).round() / 10.0
     } else {
         0.0
     };
@@ -2552,7 +2553,7 @@ fn activity_metric_total_label(
     match metric {
         UsageMetric::Tokens => {
             let total = project.total_tokens.max(0) as u64;
-            let out_of_cache = (project.total_tokens - project.cached_input_tokens).max(0) as u64;
+            let out_of_cache = (project.total_tokens - project.cache_read_tokens).max(0) as u64;
             let pair = format_horizontal_value(
                 total,
                 Some(out_of_cache),
@@ -3112,7 +3113,7 @@ fn usage_card_specs(state: &AppState, card_width: u16) -> Vec<CardSpec> {
         .unwrap_or_else(|| "--".to_string());
     let today_captions = vec![
         today
-            .map(|day| cache_hit_rate_label(day.input_tokens, day.cached_input_tokens, formatter))
+            .map(|day| cache_hit_rate_label(day.prompt_tokens(), day.cache_read_tokens, formatter))
             .unwrap_or_default(),
         today
             .map(|day| format!("Runs {}", format_count(day.agent_runs, formatter)))
@@ -4012,16 +4013,16 @@ fn aggregate_usage_days(days: &[UsageDay], grouping: ChartRange) -> Vec<UsageDay
         let start = usage_period_start(date, grouping);
         let entry = grouped.entry(start).or_insert_with(|| UsageDay {
             day: start.format("%Y-%m-%d").to_string(),
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            total_tokens: 0,
-            agent_time_ms: 0,
-            agent_runs: 0,
+            ..UsageDay::default()
         });
         entry.input_tokens = entry.input_tokens.saturating_add(day.input_tokens);
-        entry.cached_input_tokens = entry
-            .cached_input_tokens
-            .saturating_add(day.cached_input_tokens);
+        entry.cache_write_tokens = entry
+            .cache_write_tokens
+            .saturating_add(day.cache_write_tokens);
+        entry.cache_read_tokens = entry
+            .cache_read_tokens
+            .saturating_add(day.cache_read_tokens);
+        entry.output_tokens = entry.output_tokens.saturating_add(day.output_tokens);
         entry.total_tokens = entry.total_tokens.saturating_add(day.total_tokens);
         entry.agent_time_ms = entry.agent_time_ms.saturating_add(day.agent_time_ms);
         entry.agent_runs = entry.agent_runs.saturating_add(day.agent_runs);
@@ -4240,9 +4241,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let mut labels: Vec<String> = Vec::with_capacity(days.len());
     let mut tooltip_labels: Vec<String> = Vec::with_capacity(days.len());
     let mut values: Vec<u64> = Vec::with_capacity(days.len());
-    let mut token_input_values: Vec<u64> = Vec::with_capacity(days.len());
-    let mut token_non_cached_values: Vec<u64> = Vec::with_capacity(days.len());
-    let mut token_output_values: Vec<u64> = Vec::with_capacity(days.len());
+    let mut token_columns: Vec<TokenColumns> = Vec::with_capacity(days.len());
     for day in days {
         let date = NaiveDate::parse_from_str(&day.day, "%Y-%m-%d").ok();
         let label = date
@@ -4268,10 +4267,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             UsageMetric::Runs => day.agent_runs.max(0) as u64,
         };
         values.push(value);
-        let (input, non_cached, output) = usage_day_token_columns(day);
-        token_input_values.push(input);
-        token_non_cached_values.push(non_cached);
-        token_output_values.push(output);
+        token_columns.push(usage_day_token_columns(day));
     }
 
     match state.orientation {
@@ -4444,9 +4440,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
             let visible_labels = &labels[start..];
             let visible_values = &values[start..];
-            let visible_token_inputs = &token_input_values[start..];
-            let visible_token_non_cached = &token_non_cached_values[start..];
-            let visible_token_outputs = &token_output_values[start..];
+            let visible_token_columns = &token_columns[start..];
 
             let max_value = visible_values.iter().copied().max().unwrap_or(0).max(1);
 
@@ -4470,20 +4464,14 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
             // Reserve the space needed by independently aligned token columns.
             let desired_value_w = if state.metric == UsageMetric::Tokens {
-                horizontal_token_columns_widths(
-                    visible_token_inputs,
-                    visible_token_non_cached,
-                    visible_token_outputs,
-                    u16::MAX,
-                    formatter,
-                )
-                .map(|(input, non_cached, output)| {
-                    input
-                        .saturating_add(non_cached)
-                        .saturating_add(output)
-                        .saturating_add(6)
-                })
-                .unwrap_or(1)
+                horizontal_token_columns_widths(visible_token_columns, u16::MAX, formatter)
+                    .map(|widths| {
+                        widths
+                            .iter()
+                            .sum::<usize>()
+                            .saturating_add(TOKEN_COLUMN_SEPARATORS_WIDTH)
+                    })
+                    .unwrap_or(1)
             } else {
                 let mut max_len = 0usize;
                 for v in visible_values {
@@ -4513,13 +4501,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 .saturating_sub(value_w)
                 .max(1);
             let token_column_widths = if state.metric == UsageMetric::Tokens {
-                horizontal_token_columns_widths(
-                    visible_token_inputs,
-                    visible_token_non_cached,
-                    visible_token_outputs,
-                    value_w,
-                    formatter,
-                )
+                horizontal_token_columns_widths(visible_token_columns, value_w, formatter)
             } else {
                 None
             };
@@ -4605,9 +4587,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                 let value_max_width = value_area.width;
                 let value_text = if state.metric == UsageMetric::Tokens {
                     format_horizontal_token_columns(
-                        visible_token_inputs[idx],
-                        visible_token_non_cached[idx],
-                        visible_token_outputs[idx],
+                        visible_token_columns[idx],
                         value_max_width,
                         token_column_widths,
                         formatter,
@@ -4658,20 +4638,26 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
 fn usage_chart_metric_label(metric: UsageMetric) -> &'static str {
     match metric {
-        UsageMetric::Tokens => "TOKENS (INPUT / NON-CACHED / OUTPUT)",
+        UsageMetric::Tokens => "TOKENS (INPUT / CACHE-WRITE / CACHE-READ / OUTPUT)",
         UsageMetric::Time => "TIME",
         UsageMetric::Runs => "RUNS",
     }
 }
 
-fn usage_day_token_columns(day: &UsageDay) -> (u64, u64, u64) {
-    (
+/// Token columns of one chart row: uncached input, cache writes, cache
+/// reads, and output.
+type TokenColumns = [u64; 4];
+
+/// Width of the three " / " separators between token columns.
+const TOKEN_COLUMN_SEPARATORS_WIDTH: usize = 9;
+
+fn usage_day_token_columns(day: &UsageDay) -> TokenColumns {
+    [
         day.input_tokens.max(0) as u64,
-        day.input_tokens
-            .saturating_sub(day.cached_input_tokens)
-            .max(0) as u64,
-        day.total_tokens.saturating_sub(day.input_tokens).max(0) as u64,
-    )
+        day.cache_write_tokens.max(0) as u64,
+        day.cache_read_tokens.max(0) as u64,
+        day.output_tokens.max(0) as u64,
+    ]
 }
 
 fn hovered_vertical_bar_index(
@@ -4948,73 +4934,62 @@ fn format_horizontal_value(
 }
 
 fn horizontal_token_columns_widths(
-    values: &[u64],
-    non_cached_values: &[u64],
-    output_values: &[u64],
+    rows: &[TokenColumns],
     max_width: u16,
     formatter: DisplayFormatter<'_>,
-) -> Option<(usize, usize, usize)> {
-    let mut widths = [0usize; 3];
-
-    for ((&input, &non_cached), &output) in values.iter().zip(non_cached_values).zip(output_values)
-    {
-        for (idx, value) in [input, non_cached, output].into_iter().enumerate() {
-            let formatted = format_tokens_overview(value as i64, formatter);
+) -> Option<[usize; 4]> {
+    let mut widths = [0usize; 4];
+    for row in rows {
+        for (idx, value) in row.iter().enumerate() {
+            let formatted = format_tokens_overview(*value as i64, formatter);
             widths[idx] = widths[idx].max(UnicodeWidthStr::width(formatted.as_str()));
         }
     }
 
-    let full_width = widths.iter().sum::<usize>().saturating_add(6);
+    let full_width = widths
+        .iter()
+        .sum::<usize>()
+        .saturating_add(TOKEN_COLUMN_SEPARATORS_WIDTH);
     if full_width <= max_width as usize {
-        return Some((widths[0], widths[1], widths[2]));
+        return Some(widths);
     }
-    if max_width < 9 {
+    if usize::from(max_width) < TOKEN_COLUMN_SEPARATORS_WIDTH + widths.len() {
         return None;
     }
 
-    let digits_width = usize::from(max_width.saturating_sub(6));
-    let mut compact_widths = [0usize; 3];
-    for ((&input, &non_cached), &output) in values.iter().zip(non_cached_values).zip(output_values)
-    {
-        for (idx, value) in [input, non_cached, output].into_iter().enumerate() {
-            let compact = format_compact_kmb(value, 5, formatter);
+    let digits_width = usize::from(max_width).saturating_sub(TOKEN_COLUMN_SEPARATORS_WIDTH);
+    let mut compact_widths = [0usize; 4];
+    for row in rows {
+        for (idx, value) in row.iter().enumerate() {
+            let compact = format_compact_kmb(*value, 5, formatter);
             compact_widths[idx] = compact_widths[idx].max(UnicodeWidthStr::width(compact.as_str()));
         }
     }
     if compact_widths.iter().sum::<usize>() <= digits_width {
-        return Some((compact_widths[0], compact_widths[1], compact_widths[2]));
+        return Some(compact_widths);
     }
 
-    let base = digits_width / 3;
-    let remainder = digits_width % 3;
-    Some((
-        base + usize::from(remainder > 0),
-        base + usize::from(remainder > 1),
-        base,
-    ))
+    let base = digits_width / 4;
+    let remainder = digits_width % 4;
+    Some(std::array::from_fn(|idx| {
+        base + usize::from(idx < remainder)
+    }))
 }
 
 fn format_horizontal_token_columns(
-    input: u64,
-    non_cached: u64,
-    output: u64,
+    row: TokenColumns,
     max_width: u16,
-    columns: Option<(usize, usize, usize)>,
+    columns: Option<[usize; 4]>,
     formatter: DisplayFormatter<'_>,
 ) -> String {
-    let Some((input_width, non_cached_width, output_width)) = columns else {
+    let Some(widths) = columns else {
         return "\u{2026}".to_string();
     };
-    let numbers = [input, non_cached, output];
-    let widths = [input_width, non_cached_width, output_width];
-    let cells: [String; 3] =
-        std::array::from_fn(|idx| format_token_column_cell(numbers[idx], widths[idx], formatter));
-    let value = format!(
-        "{} / {} / {}",
-        right_align_token_cell(&cells[0], input_width),
-        right_align_token_cell(&cells[1], non_cached_width),
-        right_align_token_cell(&cells[2], output_width),
-    );
+    let cells: [String; 4] = std::array::from_fn(|idx| {
+        let cell = format_token_column_cell(row[idx], widths[idx], formatter);
+        right_align_token_cell(&cell, widths[idx])
+    });
+    let value = cells.join(" / ");
     if UnicodeWidthStr::width(value.as_str()) <= max_width as usize {
         value
     } else {
@@ -5104,7 +5079,7 @@ fn render_top_models(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             spans.push(Span::styled(
                 format!(
                     "{} {}%",
-                    truncate_middle(&m.model, 18),
+                    truncate_middle(&crate::usage::model_display_name(&m.model), 18),
                     formatter.format_one_decimal(m.share_percent)
                 ),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -5770,7 +5745,11 @@ fn render_today_card(
         .as_ref()
         .and_then(|snapshot| snapshot.days_for_zone(state.usage_zone).last())
         .map(|day| {
-            cache_hit_rate_label(day.input_tokens, day.cached_input_tokens, state.formatter())
+            cache_hit_rate_label(
+                day.prompt_tokens(),
+                day.cache_read_tokens,
+                state.formatter(),
+            )
         });
     frame.render_widget(
         card_with_captions(
@@ -7404,18 +7383,20 @@ mod tests {
             UsageDay {
                 day: "2026-04-05".to_string(),
                 input_tokens: 10,
-                cached_input_tokens: 2,
+                cache_read_tokens: 2,
                 total_tokens: 12,
                 agent_time_ms: 100,
                 agent_runs: 1,
+                ..UsageDay::default()
             },
             UsageDay {
                 day: "2026-04-06".to_string(),
                 input_tokens: 20,
-                cached_input_tokens: 3,
+                cache_read_tokens: 3,
                 total_tokens: 24,
                 agent_time_ms: 200,
                 agent_runs: 2,
+                ..UsageDay::default()
             },
         ];
         let grouped = aggregate_usage_days(&days, ChartRange::Week);
@@ -7596,7 +7577,7 @@ mod tests {
     fn token_chart_header_explains_the_slash_pair() {
         assert_eq!(
             usage_chart_metric_label(UsageMetric::Tokens),
-            "TOKENS (INPUT / NON-CACHED / OUTPUT)"
+            "TOKENS (INPUT / CACHE-WRITE / CACHE-READ / OUTPUT)"
         );
     }
 
@@ -8473,64 +8454,31 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_token_columns_use_input_non_cached_and_output_semantics() {
+    fn horizontal_token_columns_show_input_cache_write_cache_read_and_output() {
         let system_locale = crate::locale::SystemLocale::default();
         let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
         let day = UsageDay {
             day: "2026-09-24".to_string(),
-            input_tokens: 10_000,
-            cached_input_tokens: 8_000,
+            input_tokens: 2_000,
+            cache_write_tokens: 1_000,
+            cache_read_tokens: 7_000,
+            output_tokens: 500,
             total_tokens: 10_500,
-            agent_time_ms: 0,
-            agent_runs: 0,
+            ..UsageDay::default()
         };
-        let (input, non_cached, output) = usage_day_token_columns(&day);
-        assert_eq!((input, non_cached, output), (10_000, 2_000, 500));
-        let columns = horizontal_token_columns_widths(
-            &[input],
-            &[non_cached],
-            &[output],
-            u16::MAX,
-            formatter,
-        );
+        let row = usage_day_token_columns(&day);
+        assert_eq!(row, [2_000, 1_000, 7_000, 500]);
+        let columns = horizontal_token_columns_widths(&[row], u16::MAX, formatter);
         assert_eq!(
-            format_horizontal_token_columns(input, non_cached, output, 24, columns, formatter),
-            "10,000 / 2,000 / 500"
+            format_horizontal_token_columns(row, 40, columns, formatter),
+            "2,000 / 1,000 / 7,000 / 500"
         );
-        let fully_cached = UsageDay {
-            input_tokens: 10_000,
-            cached_input_tokens: 10_000,
-            total_tokens: 10_000,
-            ..day.clone()
-        };
-        assert_eq!(usage_day_token_columns(&fully_cached), (10_000, 0, 0));
-        let output_only = UsageDay {
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            total_tokens: 500,
-            ..day.clone()
-        };
-        assert_eq!(usage_day_token_columns(&output_only), (0, 0, 500));
-        for (input, non_cached, output, expected) in [
-            (0, 0, 0, "0 / 0 / 0"),
-            (10_000, 0, 0, "10,000 / 0 / 0"),
-            (0, 0, 500, "0 / 0 / 500"),
-        ] {
-            let width = expected.len() as u16;
-            let columns = horizontal_token_columns_widths(
-                &[input],
-                &[non_cached],
-                &[output],
-                u16::MAX,
-                formatter,
-            );
-            assert_eq!(
-                format_horizontal_token_columns(
-                    input, non_cached, output, width, columns, formatter
-                ),
-                expected
-            );
-        }
+        let empty = [0; 4];
+        let columns = horizontal_token_columns_widths(&[empty], u16::MAX, formatter);
+        assert_eq!(
+            format_horizontal_token_columns(empty, 13, columns, formatter),
+            "0 / 0 / 0 / 0"
+        );
     }
 
     #[test]
@@ -8538,111 +8486,62 @@ mod tests {
         let system_locale = crate::locale::SystemLocale::default();
         let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
         assert_eq!(right_align_token_cell("\u{754c}", 3), " \u{754c}");
-        let inputs = [0, 121_030_387, 403_643_361];
-        let non_cached = [0, 7_630_451, 15_714_273];
-        let outputs = [0, 8_681_443, 287_431_139];
-        let columns =
-            horizontal_token_columns_widths(&inputs, &non_cached, &outputs, u16::MAX, formatter);
-        let rows = inputs
+        let rows: [TokenColumns; 3] = [
+            [0, 0, 0, 0],
+            [121_030_387, 5_000_000, 115_000_000, 8_681_443],
+            [403_643_361, 15_714_273, 387_929_088, 287_431_139],
+        ];
+        let columns = horizontal_token_columns_widths(&rows, u16::MAX, formatter);
+        assert_eq!(columns, Some([11, 10, 11, 11]));
+        let formatted = rows
             .iter()
-            .zip(non_cached)
-            .zip(outputs)
-            .map(|((&input, non_cached), output)| {
-                format_horizontal_token_columns(
-                    input,
-                    non_cached,
-                    output,
-                    u16::MAX,
-                    columns,
-                    formatter,
-                )
-            })
+            .map(|row| format_horizontal_token_columns(*row, u16::MAX, columns, formatter))
             .collect::<Vec<_>>();
-        assert_eq!(columns, Some((11, 10, 11)));
-        assert!(rows
+        let separators = |row: &String| {
+            row.match_indices(" / ")
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        };
+        assert!(formatted
             .iter()
-            .all(|row| row.find(" / ") == rows[0].find(" / ")));
-        assert!(rows
-            .iter()
-            .all(|row| row.rfind(" / ") == rows[0].rfind(" / ")));
+            .all(|row| separators(row) == separators(&formatted[0])));
 
-        let tight = horizontal_token_columns_widths(
-            &[1_000_000],
-            &[2_000_000],
-            &[3_000_000],
-            15,
-            formatter,
-        );
-        let compact =
-            format_horizontal_token_columns(1_000_000, 2_000_000, 3_000_000, 15, tight, formatter);
-        assert!(UnicodeWidthStr::width(compact.as_str()) <= 15);
-        assert_eq!(compact.matches(" / ").count(), 2);
-        assert_eq!(compact, "1M / 2M / 3M");
+        let tight_row = [1_000_000, 2_000_000, 3_000_000, 4_000_000];
+        let tight = horizontal_token_columns_widths(&[tight_row], 21, formatter);
+        let compact = format_horizontal_token_columns(tight_row, 21, tight, formatter);
+        assert_eq!(compact, "1M / 2M / 3M / 4M");
         for style in [
             DisplayStyle::Classic,
             DisplayStyle::SystemCompact,
             DisplayStyle::SystemFull,
         ] {
             let mixed_formatter = DisplayFormatter::new(style, &system_locale);
-            let mixed_columns =
-                horizontal_token_columns_widths(&[1_000_000], &[0], &[500], 15, mixed_formatter);
+            let mixed_row = [1_000_000, 0, 0, 500];
+            let mixed_columns = horizontal_token_columns_widths(&[mixed_row], 21, mixed_formatter);
             assert_eq!(
-                format_horizontal_token_columns(
-                    1_000_000,
-                    0,
-                    500,
-                    15,
-                    mixed_columns,
-                    mixed_formatter,
-                ),
-                "1M / 0 / 500",
+                format_horizontal_token_columns(mixed_row, 21, mixed_columns, mixed_formatter),
+                "1M / 0 / 0 / 500",
                 "{style:?}"
             );
         }
+        assert_eq!(horizontal_token_columns_widths(&rows, 12, formatter), None);
         assert_eq!(
-            horizontal_token_columns_widths(&inputs, &non_cached, &outputs, 8, formatter),
-            None
-        );
-        assert_eq!(
-            format_horizontal_token_columns(1, 1, 0, 8, None, formatter),
+            format_horizontal_token_columns([1, 1, 0, 0], 12, None, formatter),
             "\u{2026}"
         );
-        let one_cell_columns =
-            horizontal_token_columns_widths(&[999], &[999], &[999], 9, formatter);
+        let nines = [999; 4];
+        let one_cell_columns = horizontal_token_columns_widths(&[nines], 13, formatter);
         assert_eq!(
-            format_horizontal_token_columns(999, 999, 999, 9, one_cell_columns, formatter),
-            "\u{2026} / \u{2026} / \u{2026}"
+            format_horizontal_token_columns(nines, 13, one_cell_columns, formatter),
+            "\u{2026} / \u{2026} / \u{2026} / \u{2026}"
         );
 
         let full_formatter = DisplayFormatter::new(DisplayStyle::SystemFull, &system_locale);
-        let full_columns = horizontal_token_columns_widths(
-            &inputs,
-            &non_cached,
-            &outputs,
-            u16::MAX,
-            full_formatter,
-        );
-        let full = format_horizontal_token_columns(
-            inputs[2],
-            non_cached[2],
-            outputs[2],
-            u16::MAX,
-            full_columns,
-            full_formatter,
-        );
+        let full_columns = horizontal_token_columns_widths(&rows, u16::MAX, full_formatter);
+        let full = format_horizontal_token_columns(rows[2], u16::MAX, full_columns, full_formatter);
         assert!(
-            full.contains("403 643 361 / 15 714 273 / 287 431 139"),
+            full.contains("403 643 361 / 15 714 273 / 387 929 088 / 287 431 139"),
             "{full:?}"
-        );
-        assert_eq!(
-            format_horizontal_token_columns(1, 1, 0, 8, None, full_formatter),
-            "\u{2026}"
-        );
-        let narrow_full =
-            horizontal_token_columns_widths(&[10_000], &[2_000], &[500], 9, full_formatter);
-        assert_eq!(
-            format_horizontal_token_columns(10_000, 2_000, 500, 9, narrow_full, full_formatter),
-            "\u{2026} / \u{2026} / \u{2026}"
         );
     }
 
@@ -8655,7 +8554,7 @@ mod tests {
             days: Vec::new(),
             last_activity_day: Some("2026-06-05".to_string()),
             total_tokens: 250,
-            cached_input_tokens: 150,
+            cache_read_tokens: 150,
             agent_time_ms: 0,
             agent_runs: 0,
         };

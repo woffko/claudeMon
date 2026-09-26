@@ -619,6 +619,7 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
+    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
     fn build_catalog_keeps_case_distinct_linux_paths_separate() {
         let root = make_temp_dir("group");
         let sessions = root.join("sessions");
@@ -655,6 +656,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
     fn build_catalog_keeps_session_at_origin_when_tools_access_external_projects() {
         let root = make_temp_dir("tool-workdir-owner");
         let sessions = root.join("sessions");
@@ -692,6 +694,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
     fn build_catalog_keeps_late_referenced_paths_under_session_origin() {
         let root = make_temp_dir("late-external-reference");
         let sessions = root.join("sessions/2026/07/26");
@@ -731,6 +734,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
     fn build_catalog_recovers_late_meta_without_rehoming_to_settings() {
         let root = make_temp_dir("late-owner-recovery");
         let sessions = root.join("sessions/2026/07/29");

@@ -13,3 +13,13 @@ All notable changes to this project are documented in this file.
 - Removed the Codex App Server client and the `--codex-bin`,
   `--app-server-bin`, and `--cwd` options. Live limits report "unavailable"
   until a Claude limit source is implemented.
+- Usage statistics now come from Claude Code transcripts
+  (`<claude-dir>/projects/**/*.jsonl`, including subagent transcripts),
+  with usage deduplicated per API response.
+- The Usage chart shows four token columns: INPUT / CACHE-WRITE /
+  CACHE-READ / OUTPUT. Cache hit rate is cache reads over all prompt tokens.
+- Runs count turns (distinct prompt ids); agent time uses Claude Code's
+  recorded turn durations when available.
+- Usage history is kept for transcripts that Claude Code has already
+  deleted (`cleanupPeriodDays`).
+- Model names are shown as "Opus 5.5", "Sonnet 5", and so on.
