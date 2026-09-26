@@ -708,26 +708,34 @@ fn extract_structured_evidence_from_cancellable(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if value.get("type").and_then(Value::as_str) != Some("response_item") {
+        if value.get("type").and_then(Value::as_str) != Some("assistant") {
             continue;
         }
-        let Some(payload) = value.get("payload").and_then(Value::as_object) else {
-            continue;
-        };
-        if payload.get("type").and_then(Value::as_str) != Some("function_call") {
-            continue;
+        let record_cwd = value
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|cwd| valid_absolute_path(cwd));
+        let blocks = value
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array);
+        for block in blocks.into_iter().flatten() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+            let Some(input) = block.get("input").and_then(Value::as_object) else {
+                continue;
+            };
+            // Claude tools resolve relative paths against the session cwd.
+            let mut arguments = input.clone();
+            if let Some(cwd) = record_cwd {
+                arguments
+                    .entry("cwd")
+                    .or_insert_with(|| Value::String(cwd.to_string()));
+            }
+            extract_argument_evidence(name, &Value::Object(arguments), &mut evidence);
         }
-        let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
-        let Some(arguments_raw) = payload.get("arguments").and_then(Value::as_str) else {
-            continue;
-        };
-        if arguments_raw.len() > MAX_COMMAND_BYTES.saturating_mul(2) {
-            continue;
-        }
-        let Ok(arguments) = serde_json::from_str::<Value>(arguments_raw) else {
-            continue;
-        };
-        extract_argument_evidence(name, &arguments, &mut evidence);
         if evidence.len() >= MAX_RELATED_PROJECTS_PER_SESSION.saturating_mul(8) {
             break;
         }
@@ -762,11 +770,9 @@ fn extract_argument_evidence(name: &str, arguments: &Value, out: &mut Vec<PathEv
         push_evidence(out, workdir, SOURCE_WORKDIR, 80);
     }
 
-    let modifying = name.contains("patch")
-        || name.contains("write")
-        || name.contains("edit")
-        || name.contains("create");
-    for key in ["path", "file_path", "target_path"] {
+    let lower_name = name.to_ascii_lowercase();
+    let modifying = lower_name.contains("write") || lower_name.contains("edit");
+    for key in ["path", "file_path", "notebook_path", "target_path"] {
         if let Some(raw) = object.get(key).and_then(Value::as_str) {
             if let Some(path) = resolve_evidence_path(raw, trusted_workdir) {
                 push_evidence(
@@ -819,25 +825,6 @@ fn extract_argument_evidence(name: &str, arguments: &Value, out: &mut Vec<PathEv
             }
         }
     }
-    if name.to_ascii_lowercase().contains("patch") {
-        for key in ["patch", "input"] {
-            let Some(patch) = object.get(key).and_then(Value::as_str) else {
-                continue;
-            };
-            if patch.len() > MAX_COMMAND_BYTES {
-                continue;
-            }
-            for line in patch.lines() {
-                let raw = ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
-                    .iter()
-                    .find_map(|prefix| line.strip_prefix(prefix));
-                let Some(raw) = raw else { continue };
-                if let Some(path) = resolve_evidence_path(raw.trim(), trusted_workdir) {
-                    push_evidence(out, &path, SOURCE_FILE_TARGET, 70);
-                }
-            }
-        }
-    }
 }
 
 fn looks_like_command_path(token: &str) -> bool {
@@ -853,21 +840,21 @@ fn looks_like_command_path(token: &str) -> bool {
         || Path::new(token).extension().is_some()
 }
 
+/// Claude Code tools whose structured input names files or directories.
 fn is_evidence_tool(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     [
-        "exec_command",
-        "shell_command",
-        "apply_patch",
-        "write_file",
-        "edit_file",
-        "create_file",
-        "read_file",
-        "read_text_file",
-        "view_image",
+        "bash",
+        "read",
+        "edit",
+        "multiedit",
+        "write",
+        "notebookedit",
+        "glob",
+        "grep",
+        "ls",
     ]
-    .iter()
-    .any(|allowed| name == *allowed || name.ends_with(&format!("__{allowed}")))
+    .contains(&name.as_str())
 }
 
 fn resolve_evidence_path(raw: &str, workdir: Option<&str>) -> Option<String> {
@@ -1479,25 +1466,25 @@ mod tests {
         let body = format!(
             "{}\n{}\n{}\n",
             serde_json::json!({
-                "type": "response_item",
-                "payload": {"type": "message", "role": "user", "content": [{
-                    "type": "input_text", "text": "/secret/prose/project"
+                "type": "user",
+                "cwd": "/safe/project",
+                "message": {"role": "user", "content": "/secret/prose/project"}
+            }),
+            serde_json::json!({
+                "type": "user",
+                "cwd": "/safe/project",
+                "message": {"role": "user", "content": [{
+                    "type": "tool_result", "tool_use_id": "t", "content": "/secret/output/project"
                 }]}
             }),
             serde_json::json!({
-                "type": "response_item",
-                "payload": {"type": "function_call_output", "output": "/secret/output/project"}
-            }),
-            serde_json::json!({
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call",
-                    "name": "exec_command",
-                    "arguments": serde_json::json!({
-                        "workdir": "/safe/project",
-                        "cmd": "sed -n 1,10p src/main.rs"
-                    }).to_string()
-                }
+                "type": "assistant",
+                "cwd": "/safe/project",
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "name": "Bash",
+                    "input": {"command": "sed -n 1,10p src/main.rs"}
+                }]}
             })
         );
         std::fs::write(&session, body).expect("write session");
@@ -1526,7 +1513,7 @@ mod tests {
     fn catalog_scan_links_structured_workdir_and_round_trips_sqlite() {
         let root = temp_dir("round-trip");
         let project = root.join("project");
-        let sessions = root.join("sessions/2026/07/29");
+        let sessions = root.join("projects/-launcher");
         std::fs::create_dir_all(project.join(".git")).expect("project git dir");
         std::fs::write(
             project.join(".git/config"),
@@ -1540,27 +1527,25 @@ mod tests {
         let body = format!(
             "{}\n{}\n",
             serde_json::json!({
-                "type": "session_meta",
-                "payload": {
-                    "id": "session",
-                    "timestamp": "2026-07-29T10:00:00Z",
-                    "cwd": root.join("launcher")
-                }
+                "type": "user",
+                "sessionId": "session",
+                "timestamp": "2026-07-29T10:00:00Z",
+                "cwd": root.join("launcher"),
+                "message": {"role": "user", "content": "run the tests"}
             }),
             serde_json::json!({
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call",
-                    "name": "exec_command",
-                    "arguments": serde_json::json!({
-                        "workdir": project_workdir,
-                        "cmd": "cargo test"
-                    }).to_string()
-                }
+                "type": "assistant",
+                "timestamp": "2026-07-29T10:00:05Z",
+                "cwd": project_workdir,
+                "message": {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "name": "Bash",
+                    "input": {"command": "cargo test"}
+                }]}
             })
         );
         std::fs::write(&session_path, body).expect("session file");
-        let sessions_root = root.join("sessions");
+        let sessions_root = root.join("projects");
         let strict = crate::read::scan::build_catalog(&sessions_root).expect("strict catalog");
         let config = CatalogScanConfig {
             sessions_dir: sessions_root.clone(),

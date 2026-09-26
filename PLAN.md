@@ -238,16 +238,24 @@ Sub-views, switched with a small tab row (like Claude Code `/stats`):
 - [ ] Optional import of `stats-cache.json` history older than the oldest
       transcript (per-model daily tokens only).
 
-### Phase 3 - Session history (2 days)
+### Phase 3 - Session history (done)
 
-- [ ] Adapt `src/read/scan.rs`: session meta from the first record with
-      `cwd`/`gitBranch`/`version`; title from latest `ai-title`; preview from
-      `last-prompt` / first meaningful user text.
-- [ ] Group by project path from `cwd`; keep CoMon's Strict/Deep/Full catalog
-      logic, remapping evidence extraction to Claude tool names
-      (`Bash`, `Read`, `Edit`, `Write`, ...).
-- [ ] Subagent transcripts nested under their parent session.
-- [ ] Optional: show `claude --resume <session-id>` for the selected session.
+- [x] Adapt `src/read/scan.rs`: session meta from the first records
+      (`sessionId`, `gitBranch`, `version`, timestamp, first model); title
+      from `custom-title`, else the latest `ai-title`, else `summary`, else
+      the first meaningful user prompt (Claude Code wrappers such as
+      `<command-...>`, `<local-command...>`, reminders, and task
+      notifications are skipped). Title records after the header window are
+      found with a cheap substring prefilter.
+- [x] Group by project path from the launch cwd; Strict/Deep/Full catalog
+      logic kept, evidence extraction remapped to Claude `tool_use` blocks
+      (`Bash`, `Read`, `Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `Glob`,
+      `Grep`, `LS`) with relative paths resolved against the record cwd.
+- [x] Subagent transcripts nested under their parent session (count in the
+      list, file names in the detail); orphans are listed on their own.
+- [x] Session detail: client version, deduplicated four-column tokens,
+      tool calls/results, thinking blocks, user turns.
+- [x] Optional: show `claude --resume <session-id>` for the selected session.
 
 ### Phase 4 - APISTAT (4-5 days)
 

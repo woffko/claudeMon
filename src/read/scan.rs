@@ -12,7 +12,10 @@ use std::time::SystemTime;
 
 const MAX_TITLE_CHARS: usize = 96;
 const MAX_TURN_PREVIEW_CHARS: usize = 220;
+/// Lines longer than this are skipped by the summary scan (large tool results).
+const MAX_SUMMARY_LINE_BYTES: usize = 512 * 1024;
 const UNRESOLVED_SESSION_OWNER: &str = "<unresolved session owner>";
+const SUBAGENTS_DIR: &str = "subagents";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Catalog {
@@ -45,10 +48,11 @@ pub(crate) struct SessionSummary {
     pub(crate) started_at_label: String,
     pub(crate) started_at_sort_key_ms: i64,
     pub(crate) git_branch: Option<String>,
-    pub(crate) git_commit: Option<String>,
-    pub(crate) repo_url: Option<String>,
-    pub(crate) model_provider: Option<String>,
+    /// Claude Code version that wrote the transcript.
+    pub(crate) client_version: Option<String>,
     pub(crate) model: Option<String>,
+    /// Subagent transcripts (`<session-id>/subagents/*.jsonl`) of this session.
+    pub(crate) subagent_files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,10 +63,26 @@ pub(crate) struct SessionDetail {
     pub(crate) tool_calls: usize,
     pub(crate) tool_outputs: usize,
     pub(crate) input_images: usize,
-    pub(crate) total_tokens: Option<i64>,
-    pub(crate) input_tokens: Option<i64>,
-    pub(crate) output_tokens: Option<i64>,
-    pub(crate) reasoning_encrypted: bool,
+    pub(crate) thinking_blocks: usize,
+    pub(crate) usage: Option<SessionTokenUsage>,
+}
+
+/// Deduplicated token usage of one transcript.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionTokenUsage {
+    pub(crate) input: i64,
+    pub(crate) cache_write: i64,
+    pub(crate) cache_read: i64,
+    pub(crate) output: i64,
+}
+
+impl SessionTokenUsage {
+    pub(crate) fn total(&self) -> i64 {
+        self.input
+            .saturating_add(self.cache_write)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.output)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -76,12 +96,13 @@ struct SessionSummaryBuilder {
     session_id: Option<String>,
     first_user_text: Option<String>,
     meaningful_title: Option<String>,
+    ai_title: Option<String>,
+    custom_title: Option<String>,
+    summary_title: Option<String>,
     started_at_raw: Option<String>,
     started_at_sort_key_ms: i64,
     git_branch: Option<String>,
-    git_commit: Option<String>,
-    repo_url: Option<String>,
-    model_provider: Option<String>,
+    client_version: Option<String>,
     model: Option<String>,
 }
 
@@ -99,11 +120,45 @@ pub(crate) fn build_catalog(sessions_dir: &Path) -> Result<Catalog> {
     collect_session_files(sessions_dir, &mut candidates)?;
     candidates.sort();
 
+    // Subagent transcripts live in `<project>/<session-id>/subagents/` and are
+    // attached to their parent session instead of being listed on their own.
+    let mut subagents: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut top_level = Vec::new();
+    for path in candidates {
+        match subagent_parent_session_id(&path) {
+            Some(parent) => subagents.entry(parent).or_default().push(path),
+            None => top_level.push(path),
+        }
+    }
+
     let mut grouped: BTreeMap<String, ProjectBuilder> = BTreeMap::new();
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
 
-    for path in candidates {
+    for path in top_level {
+        match scan_session_summary(&path) {
+            Ok(mut summary) => {
+                files_scanned += 1;
+                let file_session_id = path.file_stem().and_then(|stem| stem.to_str());
+                for key in [Some(summary.session_id.as_str()), file_session_id]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(files) = subagents.remove(key) {
+                        summary.subagent_files.extend(files);
+                    }
+                }
+                let key = normalize_project_key(&summary.cwd);
+                grouped.entry(key).or_default().sessions.push(summary);
+            }
+            Err(_) => {
+                files_skipped += 1;
+            }
+        }
+    }
+
+    // Subagents whose parent transcript is gone are still listed.
+    for path in subagents.into_values().flatten() {
         match scan_session_summary(&path) {
             Ok(summary) => {
                 files_scanned += 1;
@@ -124,6 +179,14 @@ pub(crate) fn build_catalog(sessions_dir: &Path) -> Result<Catalog> {
         files_scanned,
         files_skipped,
     })
+}
+
+fn subagent_parent_session_id(path: &Path) -> Option<String> {
+    let dir = path.parent()?;
+    if dir.file_name()?.to_str()? != SUBAGENTS_DIR {
+        return None;
+    }
+    dir.parent()?.file_name()?.to_str().map(ToOwned::to_owned)
 }
 
 fn finish_project_builders(grouped: BTreeMap<String, ProjectBuilder>) -> Vec<ProjectRecord> {
@@ -170,6 +233,8 @@ pub(crate) fn load_session_detail(path: &Path) -> Result<SessionDetail> {
     let mut reader = BufReader::new(file);
     let mut line = String::new();
     let mut detail = SessionDetail::default();
+    let mut last_usage_key: Option<String> = None;
+    let mut last_text_message_id: Option<String> = None;
 
     loop {
         line.clear();
@@ -181,75 +246,76 @@ pub(crate) fn load_session_detail(path: &Path) -> Result<SessionDetail> {
             break;
         }
 
-        let value = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(message) = value.get("message") else {
+            continue;
         };
 
-        let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let payload = value.get("payload").and_then(Value::as_object);
-
-        match entry_type {
-            "response_item" => {
-                if let Some(payload) = payload {
-                    let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
-                    match payload_type {
-                        "message" => {
-                            let role = payload.get("role").and_then(Value::as_str).unwrap_or("");
-                            if role == "user" {
-                                let texts = extract_message_texts(payload, "input_text");
-                                for text in texts {
-                                    if is_meaningful_user_text(&text) {
-                                        detail.meaningful_user_turns.push(truncate_single_line(
-                                            &text,
-                                            MAX_TURN_PREVIEW_CHARS,
-                                        ));
+        match value.get("type").and_then(Value::as_str).unwrap_or("") {
+            "user" => {
+                let is_meta = value.get("isMeta").and_then(Value::as_bool) == Some(true);
+                match message.get("content") {
+                    Some(Value::String(text)) => push_user_turn(&mut detail, text, is_meta),
+                    Some(Value::Array(blocks)) => {
+                        for block in blocks {
+                            match block.get("type").and_then(Value::as_str) {
+                                Some("text") => {
+                                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                        push_user_turn(&mut detail, text, is_meta);
                                     }
-                                    detail
-                                        .all_user_turns
-                                        .push(truncate_single_line(&text, MAX_TURN_PREVIEW_CHARS));
                                 }
-                                detail.input_images += count_message_parts(payload, "input_image");
-                            } else if role == "assistant"
-                                && has_message_part(payload, "output_text")
-                            {
-                                detail.assistant_messages += 1;
+                                Some("tool_result") => detail.tool_outputs += 1,
+                                Some("image") => detail.input_images += 1,
+                                _ => {}
                             }
                         }
-                        "function_call" => {
-                            detail.tool_calls += 1;
+                    }
+                    _ => {}
+                }
+            }
+            "assistant" => {
+                if message.get("model").and_then(Value::as_str) == Some("<synthetic>") {
+                    continue;
+                }
+                let message_id = message.get("id").and_then(Value::as_str).unwrap_or("");
+                for block in message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    match block.get("type").and_then(Value::as_str) {
+                        Some("text") if last_text_message_id.as_deref() != Some(message_id) => {
+                            last_text_message_id = Some(message_id.to_string());
+                            detail.assistant_messages += 1;
                         }
-                        "function_call_output" => {
-                            detail.tool_outputs += 1;
-                        }
-                        "reasoning"
-                            if payload
-                                .get("encrypted_content")
-                                .and_then(Value::as_str)
-                                .is_some() =>
-                        {
-                            detail.reasoning_encrypted = true;
-                        }
+                        Some("tool_use") => detail.tool_calls += 1,
+                        Some("thinking") | Some("redacted_thinking") => detail.thinking_blocks += 1,
                         _ => {}
                     }
                 }
-            }
-            "event_msg" => {
-                if let Some(payload) = payload {
-                    if payload.get("type").and_then(Value::as_str) == Some("token_count") {
-                        if let Some(info) = payload.get("info") {
-                            if let Some(total_usage) =
-                                find_nested_map(info, &["total_token_usage", "totalTokenUsage"])
-                            {
-                                detail.total_tokens = read_i64(total_usage.get("total_tokens"))
-                                    .or_else(|| read_i64(total_usage.get("totalTokens")));
-                                detail.input_tokens = read_i64(total_usage.get("input_tokens"))
-                                    .or_else(|| read_i64(total_usage.get("inputTokens")));
-                                detail.output_tokens = read_i64(total_usage.get("output_tokens"))
-                                    .or_else(|| read_i64(total_usage.get("outputTokens")));
-                            }
-                        }
-                    }
+                // One response is written as one line per content block, each
+                // repeating the same usage; count it once.
+                let request_id = value.get("requestId").and_then(Value::as_str).unwrap_or("");
+                let key = format!("{message_id}:{request_id}");
+                if last_usage_key.as_deref() == Some(key.as_str()) {
+                    continue;
+                }
+                last_usage_key = Some(key);
+                if let Some(usage) = message.get("usage") {
+                    let read =
+                        |field: &str| usage.get(field).and_then(Value::as_i64).unwrap_or(0).max(0);
+                    let totals = detail.usage.get_or_insert_with(SessionTokenUsage::default);
+                    totals.input = totals.input.saturating_add(read("input_tokens"));
+                    totals.cache_write = totals
+                        .cache_write
+                        .saturating_add(read("cache_creation_input_tokens"));
+                    totals.cache_read = totals
+                        .cache_read
+                        .saturating_add(read("cache_read_input_tokens"));
+                    totals.output = totals.output.saturating_add(read("output_tokens"));
                 }
             }
             _ => {}
@@ -257,6 +323,14 @@ pub(crate) fn load_session_detail(path: &Path) -> Result<SessionDetail> {
     }
 
     Ok(detail)
+}
+
+fn push_user_turn(detail: &mut SessionDetail, text: &str, is_meta: bool) {
+    let preview = truncate_single_line(text, MAX_TURN_PREVIEW_CHARS);
+    if !is_meta && is_meaningful_user_text(text) {
+        detail.meaningful_user_turns.push(preview.clone());
+    }
+    detail.all_user_turns.push(preview);
 }
 
 fn collect_session_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -289,9 +363,11 @@ fn collect_session_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Scans a transcript for list metadata. The header lines are parsed fully;
+/// later lines are parsed only when they carry a title record, because a
+/// title can be (re)generated at any point of a session.
 fn scan_session_summary(path: &Path) -> Result<SessionSummary> {
     let owner = resolve_session_owner(path).unwrap_or(None);
-    let resolved_session_id = owner.as_ref().and_then(|owner| owner.session_id.as_deref());
     let file = File::open(path).with_context(|| format!("Unable to open {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut line = String::new();
@@ -311,135 +387,119 @@ fn scan_session_summary(path: &Path) -> Result<SessionSummary> {
             break;
         }
         lines_seen += 1;
-
-        let value = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
+        if line.len() > MAX_SUMMARY_LINE_BYTES {
+            continue;
+        }
+        let in_header = lines_seen <= PROJECT_IDENTITY_LINE_LIMIT;
+        if !in_header && !is_title_record_line(&line) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
         };
-
-        let entry_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        match entry_type {
-            "session_meta" => extract_session_meta(&mut builder, &value, resolved_session_id),
-            "turn_context" => extract_turn_context(&mut builder, &value),
-            "response_item" => extract_title_candidate(&mut builder, &value),
-            _ => {}
-        }
-
-        if lines_seen >= PROJECT_IDENTITY_LINE_LIMIT {
-            break;
-        }
+        builder.observe(&value);
     }
 
     builder.finish(owner)
 }
 
-fn extract_session_meta(
-    builder: &mut SessionSummaryBuilder,
-    value: &Value,
-    expected_session_id: Option<&str>,
-) {
-    let payload = match value.get("payload").and_then(Value::as_object) {
-        Some(payload) => payload,
-        None => return,
-    };
-
-    let session_id = payload.get("id").and_then(Value::as_str);
-    if expected_session_id.is_some_and(|expected| session_id != Some(expected)) {
-        return;
-    }
-
-    if builder.session_id.is_none() {
-        builder.session_id = session_id.map(ToOwned::to_owned);
-    }
-
-    if builder.model_provider.is_none() {
-        builder.model_provider = payload
-            .get("model_provider")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-
-    if builder.started_at_raw.is_none() {
-        if let Some(timestamp) = payload.get("timestamp").and_then(Value::as_str) {
-            builder.started_at_raw = Some(timestamp.to_string());
-            builder.started_at_sort_key_ms = parse_rfc3339_to_epoch_ms(timestamp).unwrap_or(0);
-        }
-    }
-
-    let git = match payload.get("git").and_then(Value::as_object) {
-        Some(git) => git,
-        None => return,
-    };
-
-    if builder.git_branch.is_none() {
-        builder.git_branch = git
-            .get("branch")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-    if builder.git_commit.is_none() {
-        builder.git_commit = git
-            .get("commit_hash")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-    if builder.repo_url.is_none() {
-        builder.repo_url = git
-            .get("repository_url")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-}
-
-fn extract_turn_context(builder: &mut SessionSummaryBuilder, value: &Value) {
-    let payload = match value.get("payload").and_then(Value::as_object) {
-        Some(payload) => payload,
-        None => return,
-    };
-
-    if builder.model.is_none() {
-        builder.model = payload
-            .get("model")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-    }
-}
-
-fn extract_title_candidate(builder: &mut SessionSummaryBuilder, value: &Value) {
-    let payload = match value.get("payload").and_then(Value::as_object) {
-        Some(payload) => payload,
-        None => return,
-    };
-
-    if payload.get("type").and_then(Value::as_str) != Some("message") {
-        return;
-    }
-    if payload.get("role").and_then(Value::as_str) != Some("user") {
-        return;
-    }
-
-    let texts = extract_message_texts(payload, "input_text");
-    for text in texts {
-        if builder.first_user_text.is_none() {
-            builder.first_user_text = Some(truncate_single_line(&text, MAX_TITLE_CHARS));
-        }
-        if builder.meaningful_title.is_none() && is_meaningful_user_text(&text) {
-            builder.meaningful_title = Some(truncate_single_line(&text, MAX_TITLE_CHARS));
-            break;
-        }
-    }
+fn is_title_record_line(line: &str) -> bool {
+    [
+        "\"type\":\"ai-title\"",
+        "\"type\":\"custom-title\"",
+        "\"type\":\"summary\"",
+    ]
+    .iter()
+    .any(|marker| line.contains(marker))
 }
 
 impl SessionSummaryBuilder {
+    fn observe(&mut self, value: &Value) {
+        let text_field = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToOwned::to_owned)
+        };
+
+        if self.started_at_raw.is_none() {
+            if let Some(timestamp) = value.get("timestamp").and_then(Value::as_str) {
+                if let Some(ms) = parse_rfc3339_to_epoch_ms(timestamp) {
+                    self.started_at_raw = Some(timestamp.to_string());
+                    self.started_at_sort_key_ms = ms;
+                }
+            }
+        }
+        if self.session_id.is_none() {
+            self.session_id = text_field("sessionId");
+        }
+        if self.git_branch.is_none() {
+            self.git_branch = text_field("gitBranch");
+        }
+        if self.client_version.is_none() {
+            self.client_version = text_field("version");
+        }
+
+        match value.get("type").and_then(Value::as_str).unwrap_or("") {
+            "ai-title" => {
+                if let Some(title) = text_field("aiTitle") {
+                    self.ai_title = Some(truncate_single_line(&title, MAX_TITLE_CHARS));
+                }
+            }
+            "custom-title" => {
+                if let Some(title) = text_field("customTitle") {
+                    self.custom_title = Some(truncate_single_line(&title, MAX_TITLE_CHARS));
+                }
+            }
+            "summary" => {
+                if let Some(title) = text_field("summary") {
+                    self.summary_title = Some(truncate_single_line(&title, MAX_TITLE_CHARS));
+                }
+            }
+            "user" => {
+                if self.meaningful_title.is_some()
+                    || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+                {
+                    return;
+                }
+                let Some(text) = value.get("message").and_then(user_message_text) else {
+                    return;
+                };
+                if self.first_user_text.is_none() {
+                    self.first_user_text = Some(truncate_single_line(&text, MAX_TITLE_CHARS));
+                }
+                if is_meaningful_user_text(&text) {
+                    self.meaningful_title = Some(truncate_single_line(&text, MAX_TITLE_CHARS));
+                }
+            }
+            "assistant" if self.model.is_none() => {
+                self.model = value
+                    .get("message")
+                    .and_then(|message| message.get("model"))
+                    .and_then(Value::as_str)
+                    .filter(|model| *model != "<synthetic>")
+                    .map(ToOwned::to_owned);
+            }
+            _ => {}
+        }
+    }
+
     fn finish(self, owner: Option<SessionOwner>) -> Result<SessionSummary> {
         let cwd = owner
-            .map(|owner| owner.cwd)
+            .as_ref()
+            .map(|owner| owner.cwd.clone())
             .unwrap_or_else(|| UNRESOLVED_SESSION_OWNER.to_string());
         let session_id = self
             .session_id
+            .or_else(|| owner.and_then(|owner| owner.session_id))
             .unwrap_or_else(|| self.file_path.display().to_string());
         let title = self
-            .meaningful_title
+            .custom_title
+            .or(self.ai_title)
+            .or(self.summary_title)
+            .or(self.meaningful_title)
             .or(self.first_user_text)
             .unwrap_or_else(|| format!("Session {session_id}"));
 
@@ -465,68 +525,28 @@ impl SessionSummaryBuilder {
             started_at_label,
             started_at_sort_key_ms,
             git_branch: self.git_branch,
-            git_commit: self.git_commit,
-            repo_url: self.repo_url,
-            model_provider: self.model_provider,
+            client_version: self.client_version,
             model: self.model,
+            subagent_files: Vec::new(),
         })
     }
 }
 
-fn extract_message_texts(payload: &serde_json::Map<String, Value>, part_type: &str) -> Vec<String> {
-    let mut texts = Vec::new();
-    let Some(items) = payload.get("content").and_then(Value::as_array) else {
-        return texts;
-    };
-    for item in items {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        if object.get("type").and_then(Value::as_str) != Some(part_type) {
-            continue;
+/// Text of a user message: a plain string, or the joined text blocks of a
+/// block list. Tool results are not user text.
+fn user_message_text(message: &Value) -> Option<String> {
+    match message.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let texts: Vec<&str> = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect();
+            (!texts.is_empty()).then(|| texts.join(" "))
         }
-        if let Some(text) = object.get("text").and_then(Value::as_str) {
-            texts.push(text.to_string());
-        }
+        _ => None,
     }
-    texts
-}
-
-fn count_message_parts(payload: &serde_json::Map<String, Value>, part_type: &str) -> usize {
-    let Some(items) = payload.get("content").and_then(Value::as_array) else {
-        return 0;
-    };
-    let mut count = 0usize;
-    for item in items {
-        if item.get("type").and_then(Value::as_str) == Some(part_type) {
-            count += 1;
-        }
-    }
-    count
-}
-
-fn has_message_part(payload: &serde_json::Map<String, Value>, part_type: &str) -> bool {
-    count_message_parts(payload, part_type) > 0
-}
-
-fn find_nested_map<'a>(
-    value: &'a Value,
-    keys: &[&str],
-) -> Option<&'a serde_json::Map<String, Value>> {
-    for key in keys {
-        if let Some(map) = value.get(*key).and_then(Value::as_object) {
-            return Some(map);
-        }
-    }
-    None
-}
-
-fn read_i64(value: Option<&Value>) -> Option<i64> {
-    value.and_then(|value| {
-        value
-            .as_i64()
-            .or_else(|| value.as_u64().and_then(|raw| i64::try_from(raw).ok()))
-    })
 }
 
 fn parse_rfc3339_to_epoch_ms(raw: &str) -> Option<i64> {
@@ -549,21 +569,26 @@ fn system_time_to_epoch_ms(time: SystemTime) -> Option<i64> {
     i64::try_from(duration.as_millis()).ok()
 }
 
+/// Filters out text Claude Code injects into the user role: slash-command
+/// wrappers, local command output, reminders, notifications, and caveats.
 fn is_meaningful_user_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed.starts_with("# AGENTS.md instructions") {
-        return false;
-    }
-    if trimmed.starts_with("<environment_context>") {
-        return false;
-    }
-    if trimmed.starts_with("<skill>") {
-        return false;
-    }
-    true
+    ![
+        "<command-",
+        "<local-command",
+        "<system-reminder>",
+        "<task-notification>",
+        "<bash-input>",
+        "<bash-stdout>",
+        "<bash-stderr>",
+        "Caveat:",
+        "[Request interrupted",
+    ]
+    .iter()
+    .any(|prefix| trimmed.starts_with(prefix))
 }
 
 pub(crate) fn truncate_single_line(input: &str, max_chars: usize) -> String {
@@ -613,152 +638,206 @@ mod tests {
         dir
     }
 
-    fn write_session(path: &Path, body: &str) {
+    fn write_lines(path: &Path, lines: &[Value]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
         std::fs::write(path, body).expect("write session");
+    }
+
+    fn user_text(cwd: &str, session: &str, timestamp: &str, text: &str) -> Value {
+        serde_json::json!({
+            "type": "user",
+            "cwd": cwd,
+            "sessionId": session,
+            "timestamp": timestamp,
+            "gitBranch": "main",
+            "version": "2.1.0",
+            "promptId": format!("p-{timestamp}"),
+            "message": {"role": "user", "content": text}
+        })
+    }
+
+    fn assistant_block(message_id: &str, block: Value, usage: [i64; 4]) -> Value {
+        serde_json::json!({
+            "type": "assistant",
+            "cwd": "/work/app",
+            "timestamp": "2026-09-01T10:00:05Z",
+            "requestId": format!("req-{message_id}"),
+            "message": {
+                "id": message_id,
+                "model": "claude-test-1",
+                "role": "assistant",
+                "content": [block],
+                "usage": {
+                    "input_tokens": usage[0],
+                    "cache_creation_input_tokens": usage[1],
+                    "cache_read_input_tokens": usage[2],
+                    "output_tokens": usage[3]
+                }
+            }
+        })
     }
 
     #[cfg(not(windows))]
     #[test]
-    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
     fn build_catalog_keeps_case_distinct_linux_paths_separate() {
         let root = make_temp_dir("group");
-        let sessions = root.join("sessions");
-        std::fs::create_dir_all(sessions.join("2026/03/16")).expect("create tree");
-        let session_a = sessions.join("2026/03/16/a.jsonl");
-        let session_b = sessions.join("2026/03/16/b.jsonl");
-
-        write_session(
-            &session_a,
-            r##"{"type":"session_meta","payload":{"id":"a","timestamp":"2026-03-16T08:30:22.974Z","cwd":"/mnt/e/GH/oiio-builder","model_provider":"openai"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /mnt/e/GH/oiio-builder"}]}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"show me the session history"}]}}
-"##,
+        let projects = root.join("projects");
+        write_lines(
+            &projects.join("a/a.jsonl"),
+            &[
+                user_text(
+                    "/mnt/e/GH/app",
+                    "a",
+                    "2026-03-16T08:30:22Z",
+                    "<command-name>/init</command-name>",
+                ),
+                user_text(
+                    "/mnt/e/GH/app",
+                    "a",
+                    "2026-03-16T08:30:23Z",
+                    "show me the session history",
+                ),
+            ],
         );
-        write_session(
-            &session_b,
-            r##"{"type":"session_meta","payload":{"id":"b","timestamp":"2026-03-16T09:30:22.974Z","cwd":"/mnt/e/gh/oiio-builder","model_provider":"openai"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"list prompts"}]}}
-"##,
+        write_lines(
+            &projects.join("b/b.jsonl"),
+            &[user_text(
+                "/mnt/e/gh/app",
+                "b",
+                "2026-03-16T09:30:22Z",
+                "list prompts",
+            )],
         );
 
-        let catalog = build_catalog(&sessions).expect("catalog");
+        let catalog = build_catalog(&projects).expect("catalog");
         assert_eq!(catalog.projects.len(), 2);
-        assert_eq!(catalog.projects[0].display_path, "/mnt/e/GH/oiio-builder");
-        assert_eq!(catalog.projects[0].sessions.len(), 1);
+        assert_eq!(catalog.projects[0].display_path, "/mnt/e/GH/app");
         assert_eq!(
             catalog.projects[0].sessions[0].title,
             "show me the session history"
         );
-        assert_eq!(catalog.projects[1].display_path, "/mnt/e/gh/oiio-builder");
+        assert_eq!(catalog.projects[1].display_path, "/mnt/e/gh/app");
         assert_eq!(catalog.projects[1].sessions[0].title, "list prompts");
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
-    fn build_catalog_keeps_session_at_origin_when_tools_access_external_projects() {
-        let root = make_temp_dir("tool-workdir-owner");
-        let sessions = root.join("sessions");
-        let external = root.join("nativefiledialog-extended");
-        std::fs::create_dir_all(sessions.join("2026/06/23")).expect("create sessions");
-        std::fs::create_dir_all(&external).expect("create external dir");
-        let session = sessions.join("2026/06/23/a.jsonl");
-        write_session(
-            &session,
-            &format!(
-                "{}\n{}\n{}\n",
-                r#"{"type":"session_meta","payload":{"id":"a","timestamp":"2026-06-23T08:30:22.974Z","cwd":"/outside/Charter","model_provider":"openai"}}"#,
-                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"work on the project"}]}}"#,
-                serde_json::json!({
-                    "type": "response_item",
-                    "payload": {
-                        "type": "function_call",
-                        "name": "exec_command",
-                        "arguments": serde_json::json!({
-                            "workdir": external,
-                            "cmd": format!("sed -n '1,20p' {}/CMakeLists.txt", external.display()),
-                            "sandbox_permissions": "require_escalated"
-                        }).to_string()
-                    }
-                })
-            ),
+    fn title_prefers_custom_then_latest_ai_title_over_prompt() {
+        let root = make_temp_dir("titles");
+        let projects = root.join("projects");
+        let session = projects.join("-work-app/s1.jsonl");
+        let mut lines = vec![user_text(
+            "/work/app",
+            "s1",
+            "2026-09-01T10:00:00Z",
+            "fix the build",
+        )];
+        lines.push(
+            serde_json::json!({"type": "ai-title", "sessionId": "s1", "aiTitle": "Early title"}),
         );
+        // Titles written after the header window must still be picked up.
+        for _ in 0..(PROJECT_IDENTITY_LINE_LIMIT + 10) {
+            lines.push(serde_json::json!({"type": "mode", "mode": "default"}));
+        }
+        lines.push(
+            serde_json::json!({"type": "ai-title", "sessionId": "s1", "aiTitle": "Fix musl build"}),
+        );
+        write_lines(&session, &lines);
 
-        let catalog = build_catalog(&sessions).expect("catalog");
-        assert_eq!(catalog.projects.len(), 1);
-        assert_eq!(catalog.projects[0].display_path, "/outside/Charter");
-        assert_eq!(catalog.projects[0].sessions.len(), 1);
+        let catalog = build_catalog(&projects).expect("catalog");
+        let summary = &catalog.projects[0].sessions[0];
+        assert_eq!(summary.title, "Fix musl build");
+        assert_eq!(summary.session_id, "s1");
+        assert_eq!(summary.git_branch.as_deref(), Some("main"));
+        assert_eq!(summary.client_version.as_deref(), Some("2.1.0"));
+
+        lines.push(serde_json::json!({
+            "type": "custom-title",
+            "sessionId": "s1",
+            "customTitle": "Release prep"
+        }));
+        write_lines(&session, &lines);
+        let catalog = build_catalog(&projects).expect("catalog");
+        assert_eq!(catalog.projects[0].sessions[0].title, "Release prep");
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
-    fn build_catalog_keeps_late_referenced_paths_under_session_origin() {
-        let root = make_temp_dir("late-external-reference");
-        let sessions = root.join("sessions/2026/07/26");
-        std::fs::create_dir_all(&sessions).expect("create sessions");
-
-        let session = sessions.join("session.jsonl");
-        let mut body = String::from(
-            r#"{"type":"session_meta","payload":{"id":"session","timestamp":"2026-07-26T08:00:00Z","cwd":"/outside/Charter"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"work in Charter"}]}}
-"#,
+    fn build_catalog_keeps_session_at_launch_cwd_after_cd() {
+        let root = make_temp_dir("launch-cwd");
+        let projects = root.join("projects");
+        write_lines(
+            &projects.join("-outside-Charter/s.jsonl"),
+            &[
+                user_text(
+                    "/outside/Charter",
+                    "s",
+                    "2026-06-23T08:30:22Z",
+                    "work on the project",
+                ),
+                user_text(
+                    "/outside/other",
+                    "s",
+                    "2026-06-23T08:31:22Z",
+                    "continue elsewhere",
+                ),
+            ],
         );
-        for _ in 0..140 {
-            body.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"noop\"}}\n");
-        }
-        body.push_str(
-            &serde_json::json!({
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call",
-                    "arguments": serde_json::json!({
-                        "workdir": "/outside/nativefiledialog-extended",
-                        "cmd": "sed -n '1,20p' /outside/nativefiledialog-extended/CMakeLists.txt"
-                    }).to_string()
-                }
-            })
-            .to_string(),
-        );
-        body.push('\n');
-        write_session(&session, &body);
 
-        let catalog = build_catalog(&root.join("sessions")).expect("catalog");
+        let catalog = build_catalog(&projects).expect("catalog");
         assert_eq!(catalog.projects.len(), 1);
         assert_eq!(catalog.projects[0].display_path, "/outside/Charter");
-        assert_eq!(catalog.projects[0].sessions[0].file_path, session);
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    #[ignore = "Codex transcript fixtures; replaced by the Claude history parser"]
-    fn build_catalog_recovers_late_meta_without_rehoming_to_settings() {
-        let root = make_temp_dir("late-owner-recovery");
-        let sessions = root.join("sessions/2026/07/29");
-        std::fs::create_dir_all(&sessions).expect("create sessions");
-        let session = sessions.join("late.jsonl");
-        let mut body = String::from(
-            r#"{"type":"turn_context","payload":{"cwd":"/outside/fallback"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"recover this session"}]}}
-"#,
+    fn subagent_transcripts_nest_under_their_parent_session() {
+        let root = make_temp_dir("subagents");
+        let projects = root.join("projects");
+        let session_id = "00000000-0000-4000-8000-000000000001";
+        write_lines(
+            &projects.join(format!("-work-app/{session_id}.jsonl")),
+            &[user_text(
+                "/work/app",
+                session_id,
+                "2026-09-01T10:00:00Z",
+                "parent prompt",
+            )],
         );
-        for _ in 0..128 {
-            body.push_str("{\"type\":\"event_msg\",\"payload\":{\"type\":\"noop\"}}\n");
-        }
-        body.push_str(
-            r#"{"type":"session_meta","payload":{"id":"late","timestamp":"2026-07-29T08:00:00Z","cwd":"/outside/Charter"}}
-{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"cwd":"/outside/nativefiledialog-extended"}}}
-"#,
+        let agent = projects.join(format!("-work-app/{session_id}/subagents/agent-1.jsonl"));
+        write_lines(
+            &agent,
+            &[user_text(
+                "/work/app",
+                session_id,
+                "2026-09-01T10:01:00Z",
+                "subagent task",
+            )],
         );
-        write_session(&session, &body);
+        let orphan = projects.join("-work-app/gone/subagents/agent-2.jsonl");
+        write_lines(
+            &orphan,
+            &[user_text(
+                "/work/app",
+                "gone",
+                "2026-09-01T09:00:00Z",
+                "orphan task",
+            )],
+        );
 
-        let catalog = build_catalog(&root.join("sessions")).expect("catalog");
-        assert_eq!(catalog.files_scanned, 1);
+        let catalog = build_catalog(&projects).expect("catalog");
         assert_eq!(catalog.projects.len(), 1);
-        assert_eq!(catalog.projects[0].display_path, "/outside/Charter");
+        let sessions = &catalog.projects[0].sessions;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].title, "parent prompt");
+        assert_eq!(sessions[0].subagent_files, vec![agent]);
+        assert_eq!(sessions[1].title, "orphan task");
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -766,48 +845,88 @@ mod tests {
     #[test]
     fn build_catalog_keeps_sessions_with_no_owner_visible() {
         let root = make_temp_dir("unresolved-owner");
-        let sessions = root.join("sessions/2026/07/29");
-        std::fs::create_dir_all(&sessions).expect("create sessions");
-        let session = sessions.join("unknown.jsonl");
-        write_session(
-            &session,
-            r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"cwd":"/outside/not-an-owner"}}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"orphaned session"}]}}
-"#,
+        let projects = root.join("projects");
+        write_lines(
+            &projects.join("x/unknown.jsonl"),
+            &[serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": "orphaned session"}
+            })],
         );
 
-        let catalog = build_catalog(&root.join("sessions")).expect("catalog");
+        let catalog = build_catalog(&projects).expect("catalog");
         assert_eq!(catalog.files_scanned, 1);
         assert_eq!(catalog.files_skipped, 0);
         assert_eq!(catalog.projects.len(), 1);
         assert_eq!(catalog.projects[0].display_path, UNRESOLVED_SESSION_OWNER);
+        assert_eq!(catalog.projects[0].sessions[0].title, "orphaned session");
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
-    fn load_session_detail_extracts_turns_and_tokens() {
+    fn load_session_detail_extracts_turns_tools_and_deduplicated_tokens() {
         let root = make_temp_dir("detail");
         let path = root.join("session.jsonl");
-        write_session(
+        let mut meta = user_text("/work/app", "s", "2026-09-01T10:00:00Z", "skill body");
+        meta["isMeta"] = serde_json::json!(true);
+        write_lines(
             &path,
-            r##"{"type":"session_meta","payload":{"id":"s","timestamp":"2026-03-16T08:30:22.974Z","cwd":"/mnt/w/VisualStudio/claudemon-cli","model_provider":"openai"}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /mnt/w/VisualStudio/claudemon-cli"}]}}
-{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"show all prompts"}]}}
-{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}
-{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{}"}}
-{"type":"response_item","payload":{"type":"function_call_output","call_id":"1","output":"done"}}
-{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}}}}
-"##,
+            &[
+                user_text(
+                    "/work/app",
+                    "s",
+                    "2026-09-01T10:00:00Z",
+                    "<command-name>/init</command-name>",
+                ),
+                meta,
+                user_text("/work/app", "s", "2026-09-01T10:00:01Z", "show all prompts"),
+                assistant_block(
+                    "m1",
+                    serde_json::json!({"type": "thinking", "thinking": ""}),
+                    [10, 20, 30, 4],
+                ),
+                assistant_block(
+                    "m1",
+                    serde_json::json!({"type": "text", "text": "ok"}),
+                    [10, 20, 30, 4],
+                ),
+                assistant_block(
+                    "m1",
+                    serde_json::json!({"type": "tool_use", "name": "Bash", "input": {}}),
+                    [10, 20, 30, 4],
+                ),
+                serde_json::json!({
+                    "type": "user",
+                    "message": {"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": "t", "content": "done"}
+                    ]}
+                }),
+                assistant_block(
+                    "m2",
+                    serde_json::json!({"type": "text", "text": "done"}),
+                    [1, 0, 0, 1],
+                ),
+            ],
         );
 
         let detail = load_session_detail(&path).expect("detail");
         assert_eq!(detail.meaningful_user_turns, vec!["show all prompts"]);
-        assert_eq!(detail.all_user_turns.len(), 2);
-        assert_eq!(detail.assistant_messages, 1);
+        assert_eq!(detail.all_user_turns.len(), 3);
+        assert_eq!(detail.assistant_messages, 2);
         assert_eq!(detail.tool_calls, 1);
         assert_eq!(detail.tool_outputs, 1);
-        assert_eq!(detail.total_tokens, Some(16));
+        assert_eq!(detail.thinking_blocks, 1);
+        assert_eq!(
+            detail.usage,
+            Some(SessionTokenUsage {
+                input: 11,
+                cache_write: 20,
+                cache_read: 30,
+                output: 5,
+            })
+        );
+        assert_eq!(detail.usage.map(|usage| usage.total()), Some(66));
 
         let _ = std::fs::remove_dir_all(root);
     }

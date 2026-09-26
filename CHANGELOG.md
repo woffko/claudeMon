@@ -23,3 +23,9 @@ All notable changes to this project are documented in this file.
 - Usage history is kept for transcripts that Claude Code has already
   deleted (`cleanupPeriodDays`).
 - Model names are shown as "Opus 5.5", "Sonnet 5", and so on.
+- Session history reads Claude Code transcripts: titles from custom or
+  AI-generated titles, the Claude Code version, the first model, and
+  subagent transcripts nested under their parent session.
+- Session detail shows deduplicated four-column token usage, thinking
+  blocks, and the `claude --resume` command for the session.
+- Deep/Full project discovery uses Claude Code tool calls as evidence.

@@ -1082,8 +1082,13 @@ fn render_sessions_view(
                     } else {
                         "R"
                     };
+                    let agents = if session.subagent_files.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  [+{} agents]", session.subagent_files.len())
+                    };
                     let label = format!(
-                        "{relation}  {}  {}",
+                        "{relation}  {}  {}{agents}",
                         session_started_label(session, formatter),
                         truncate_single_line(&session.title, 64)
                     );
@@ -1349,8 +1354,8 @@ fn render_session_detail(
             Span::raw(
                 session
                     .model
-                    .clone()
-                    .or_else(|| session.model_provider.clone())
+                    .as_deref()
+                    .map(crate::usage::model_display_name)
                     .unwrap_or_else(|| "--".to_string()),
             ),
         ]),
@@ -1366,20 +1371,33 @@ fn render_session_detail(
         ]),
     ];
 
-    if let Some(commit) = &session.git_commit {
+    if let Some(version) = &session.client_version {
         lines.push(Line::from(vec![
-            Span::styled("COMMIT", Style::default().fg(Color::Gray)),
+            Span::styled("CLIENT", Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::raw(truncate_single_line(commit, 24)),
+            Span::raw(format!("Claude Code {}", truncate_single_line(version, 24))),
         ]));
     }
 
-    if let Some(repo_url) = &session.repo_url {
+    lines.push(Line::from(vec![
+        Span::styled("RESUME", Style::default().fg(Color::Gray)),
+        Span::raw("  "),
+        Span::raw(format!("claude --resume {}", session.session_id)),
+    ]));
+
+    if !session.subagent_files.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("REMOTE", Style::default().fg(Color::Gray)),
+            Span::styled("SUBAGENTS", Style::default().fg(Color::Gray)),
             Span::raw("  "),
-            Span::raw(truncate_single_line(repo_url, 72)),
+            Span::raw(formatter.format_usize(session.subagent_files.len())),
         ]));
+        for path in session.subagent_files.iter().take(8) {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            lines.push(Line::from(format!("  - {name}")));
+        }
     }
 
     if let Some(raw) = &session.started_at_raw {
@@ -1408,31 +1426,32 @@ fn render_session_detail(
                 formatter.format_usize(detail.input_images)
             )),
         ]));
-        if let Some(total_tokens) = detail.total_tokens {
+        if let Some(usage) = detail.usage {
             lines.push(Line::from(vec![
                 Span::styled("TOKENS", Style::default().fg(Color::Gray)),
                 Span::raw("  "),
-                Span::raw(formatter.format_count(total_tokens)),
+                Span::raw(formatter.format_count(usage.total())),
             ]));
-        }
-        if let Some(input_tokens) = detail.input_tokens {
             lines.push(Line::from(vec![
-                Span::styled("INPUT", Style::default().fg(Color::Gray)),
+                Span::styled("IN/CW/CR/OUT", Style::default().fg(Color::Gray)),
                 Span::raw("  "),
-                Span::raw(formatter.format_count(input_tokens)),
+                Span::raw(format!(
+                    "{} / {} / {} / {}",
+                    formatter.format_count(usage.input),
+                    formatter.format_count(usage.cache_write),
+                    formatter.format_count(usage.cache_read),
+                    formatter.format_count(usage.output)
+                )),
             ]));
         }
-        if let Some(output_tokens) = detail.output_tokens {
+        if detail.thinking_blocks > 0 {
             lines.push(Line::from(vec![
-                Span::styled("OUTPUT", Style::default().fg(Color::Gray)),
+                Span::styled("THINKING", Style::default().fg(Color::Gray)),
                 Span::raw("  "),
-                Span::raw(formatter.format_count(output_tokens)),
-            ]));
-        }
-        if detail.reasoning_encrypted {
-            lines.push(Line::from(vec![
-                Span::styled("REASONING", Style::default().fg(Color::Gray)),
-                Span::raw("  encrypted"),
+                Span::raw(format!(
+                    "{} blocks",
+                    formatter.format_usize(detail.thinking_blocks)
+                )),
             ]));
         }
 
@@ -1622,10 +1641,9 @@ mod tests {
             started_at_label: "--".to_string(),
             started_at_sort_key_ms: 0,
             git_branch: None,
-            git_commit: None,
-            repo_url: None,
-            model_provider: None,
+            client_version: None,
             model: None,
+            subagent_files: Vec::new(),
         }
     }
 
