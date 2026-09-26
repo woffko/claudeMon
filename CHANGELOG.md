@@ -39,3 +39,6 @@ All notable changes to this project are documented in this file.
 - COST screen: API-equivalent cost at list prices by day, model, and
   project, with Claude Code's recorded session costs as a cross-check.
   Prices live in `config.json` (`pricing`, `pricing_updated`).
+- UI polish: orange default theme, clearer empty and not-configured states,
+  COST tab in the navigation, updated help and key hints; `ctrl+s` no
+  longer switches screens.

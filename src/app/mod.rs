@@ -142,12 +142,13 @@ impl ModelsRange {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum AccentTheme {
     Red,
+    /// Default: close to Claude's brand color.
+    #[default]
     Orange,
     Yellow,
     Chartreuse,
     Green,
     SpringGreen,
-    #[default]
     Cyan,
     Azure,
     Blue,
@@ -446,6 +447,8 @@ pub(crate) struct AppState {
     pub(crate) models_range: ModelsRange,
     pub(crate) cost_range: ModelsRange,
     pub(crate) pricing: crate::pricing::PriceTable,
+    /// Claude Code transcripts directory, shown in empty states.
+    pub(crate) sessions_dir: PathBuf,
     pub(crate) usage_period_offset: usize,
     pub(crate) usage_visible_periods: usize,
     pub(crate) usage_total_periods: usize,
@@ -975,6 +978,7 @@ async fn run_inner(
         models_range: restored_ui_state.models_range,
         cost_range: restored_ui_state.cost_range,
         pricing: config.pricing.clone(),
+        sessions_dir: config.read_sessions_dir.clone(),
         usage_period_offset: 0,
         usage_visible_periods: 0,
         usage_total_periods: 0,
@@ -2718,7 +2722,7 @@ mod tests {
 
         let loaded = load_persisted_ui_state(&claudemon_home, None).expect("load legacy ui state");
         assert_eq!(loaded.display_style, DisplayStyle::SystemFull);
-        assert_eq!(loaded.accent_theme, AccentTheme::Cyan);
+        assert_eq!(loaded.accent_theme, AccentTheme::Orange);
         assert_eq!(loaded.bar_fill_mode, BarFillMode::Semigraphic);
 
         let _ = std::fs::remove_dir_all(claudemon_home);

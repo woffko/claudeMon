@@ -780,11 +780,48 @@ fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
 
     render_usage_controls(frame, chunks[0], state);
     let weekly_hover = render_usage_cards(frame, chunks[1], state);
-    render_usage_chart(frame, chunks[2], state);
+    if state.usage.as_ref().is_some_and(snapshot_is_empty) {
+        render_no_transcripts(frame, chunks[2], state);
+    } else {
+        render_usage_chart(frame, chunks[2], state);
+    }
     render_top_models(frame, chunks[3], state);
     if let Some(hover) = weekly_hover {
         render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
     }
+}
+
+/// True when no transcript (current or archived in the cache) has usage.
+fn snapshot_is_empty(snapshot: &crate::usage::LocalUsageSnapshot) -> bool {
+    snapshot.scan_total_files == 0 && snapshot.days.iter().all(|day| day.total_tokens == 0)
+}
+
+fn render_no_transcripts(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .padding(Padding {
+            left: 2,
+            right: 1,
+            top: 1,
+            bottom: 0,
+        })
+        .title(Span::styled(" USAGE ", Style::default().fg(Color::Gray)));
+    let text = Text::from(vec![
+        Line::from(format!(
+            "No Claude Code transcripts found in {}.",
+            state.sessions_dir.display()
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Usage appears after you run Claude Code. If your transcripts live elsewhere, pass --claude-dir or set CLAUDE_CONFIG_DIR.",
+            Style::default().fg(Color::Gray),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn usage_layout(area: Rect, controls_height: u16, cards_height: u16) -> [Rect; 4] {
@@ -1070,6 +1107,7 @@ fn render_activity_message(frame: &mut Frame<'_>, area: Rect, message: &str) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_project_activity_heatmap(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1723,15 +1761,26 @@ fn uses_compact_limit_lines(card_width: u16) -> bool {
     card_width < 38
 }
 
+/// Title and caption of the limits card while no limits are available. The
+/// long status-line setup hint is shown on the APISTAT screen instead.
+fn limits_unavailable_text(state: &AppState) -> (&'static str, &str) {
+    let msg = state
+        .limits_error
+        .as_deref()
+        .or(state.limits_notice.as_deref())
+        .unwrap_or("Limits unavailable.");
+    if msg == crate::app::STATUSLINE_SETUP_HINT {
+        ("Not set up", "See the APISTAT tab for setup.")
+    } else {
+        ("Unavailable", msg)
+    }
+}
+
 fn limits_card_content(state: &AppState, compact: bool) -> (String, Vec<String>) {
     let formatter = state.formatter();
     let (value, caption1, caption2, caption3) = if !state.limits_enabled {
-        let msg = state
-            .limits_error
-            .as_deref()
-            .or(state.limits_notice.as_deref())
-            .unwrap_or("Limits unavailable.");
-        ("Unavailable".to_string(), Some(msg.to_string()), None, None)
+        let (title, msg) = limits_unavailable_text(state);
+        (title.to_string(), Some(msg.to_string()), None, None)
     } else if let Some(limits) = state.limits.as_ref() {
         format_limits_compact_card_lines(limits, compact, formatter)
     } else {
@@ -3014,8 +3063,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                         if let Some(cell) = buf.cell_mut((xx, yy)) {
                             cell.set_char(' ');
                             if filled_h > 0 && yy >= top_filled_y {
-                                cell.set_char(bar_fill.glyph)
-                                    .set_style(bar_fill.cell_style.clone());
+                                cell.set_char(bar_fill.glyph).set_style(bar_fill.cell_style);
                             }
                         }
                     }
@@ -3053,7 +3101,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                             break;
                         }
                         if let Some(cell) = buf.cell_mut((start_x + j as u16, text_y)) {
-                            cell.set_char(ch).set_style(bar_fill.value_style.clone());
+                            cell.set_char(ch).set_style(bar_fill.value_style);
                         }
                     }
                 }
@@ -3244,8 +3292,7 @@ fn render_usage_chart(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
                         if let Some(cell) = buf.cell_mut((xx, yy)) {
                             cell.set_char(' ');
                             if xx < bar_area.x.saturating_add(filled) {
-                                cell.set_char(bar_fill.glyph)
-                                    .set_style(bar_fill.cell_style.clone());
+                                cell.set_char(bar_fill.glyph).set_style(bar_fill.cell_style);
                             }
                         }
                     }
@@ -5062,13 +5109,9 @@ fn limits_card_paragraph(
     let mut tooltip: Option<String> = None;
 
     if !state.limits_enabled {
-        let msg = state
-            .limits_error
-            .as_deref()
-            .or(state.limits_notice.as_deref())
-            .unwrap_or("Limits unavailable.");
+        let (title, msg) = limits_unavailable_text(state);
         lines.push(Line::from(Span::styled(
-            "Unavailable".to_string(),
+            title.to_string(),
             Style::default().add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(

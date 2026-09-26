@@ -302,13 +302,21 @@ Sub-views, switched with a small tab row (like Claude Code `/stats`):
 - [x] Clear labeling: "API-equivalent at list prices", the price table
       date, and that subscription usage is not billed per token.
 
-### Phase 6 - UI polish (1-2 days)
+### Phase 6 - UI polish (done)
 
-- [ ] Tab bar: USAGE / APISTAT / COST / HISTORY; help overlay, key hints,
-      quit dialog, header branding.
-- [ ] Default accent theme distinct from CoMon.
-- [ ] Empty-state messages (no logs, source not configured).
-- [ ] Verify Classic / System Compact / System Full formatting.
+- [x] Tab bar: USAGE / APISTAT / COST / ACTIVITY / HISTORY (CoMon's
+      ACTIVITY heatmaps kept); help overlays, footer key hints, and header
+      (`claudemon :: <version>`) updated; no Codex wording left; `ctrl+s` no
+      longer triggers the global screen switch.
+- [x] Default accent theme is orange (close to Claude's brand color)
+      instead of CoMon's cyan.
+- [x] Empty states: USAGE explains where transcripts are expected and how
+      to point claudemon elsewhere; the LIMITS card says "Not set up" and
+      points to APISTAT, which shows the status-line setup instructions.
+- [x] Classic / System Compact / System Full verified on USAGE, COST, and
+      MODELS with real data (`1,234,567,890` / `1.23B` / `1 234 567 890`).
+- [x] Clippy is clean with no warnings (the warnings inherited from CoMon
+      were fixed as well).
 
 ### Phase 7 - Packaging and release (1 day)
 
