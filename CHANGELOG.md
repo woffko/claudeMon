@@ -29,3 +29,10 @@ All notable changes to this project are documented in this file.
 - Session detail shows deduplicated four-column token usage, thinking
   blocks, and the `claude --resume` command for the session.
 - Deep/Full project discovery uses Claude Code tool calls as evidence.
+- Live limits for Claude subscriptions: `claudemon statusline` records the
+  rate limits Claude Code passes to its status line (default source), and
+  `--live-limits oauth` reads Claude Code's OAuth usage endpoint (opt-in).
+- APISTAT shows a LIMITS view (5h, weekly, and per-model limits, extra
+  usage, usage by surface) and a MODELS view (tokens per day per model,
+  date ranges, per-model cards, copy to clipboard).
+- Removed the Codex limit-reset screen and reset button.

@@ -1,102 +1,107 @@
-//! Account limit and server-usage data shared by the APISTAT screen.
+//! Subscription limit data shown on the USAGE limits card and the APISTAT
+//! screen, and the sources that produce it (see `docs/sources.md`):
 //!
-//! The types mirror the layout the UI renders: a primary (short) and a
-//! secondary (weekly) rate-limit window, optional per-model buckets, and
-//! optional server-side daily usage. Claude limit sources (OAuth usage
-//! endpoint, status-line bridge) populate them; until a source is enabled
-//! the APISTAT screen shows an "unavailable" state.
+//! - status-line bridge (default): `claudemon statusline` records the rate
+//!   limits Claude Code passes to its status line; the TUI reads that
+//!   snapshot. No credentials are involved.
+//! - OAuth usage endpoint (opt-in): the endpoint behind Claude Code's
+//!   `/usage` screen, called with the user's Claude Code OAuth token. It adds
+//!   per-model weekly limits, extra usage, and the by-surface breakdown.
 
-// Fields are populated by limit sources added in a later phase.
-#![allow(dead_code)]
+pub mod oauth;
+pub mod statusline;
 
-#[derive(Debug, Clone)]
-pub struct RateLimitWindow {
-    pub used_percent: Option<f64>,
-    pub window_duration_mins: Option<f64>,
-    pub resets_at: Option<i64>,
-}
+use chrono::DateTime;
+use serde_json::Value;
 
-#[derive(Debug, Clone)]
-pub struct CreditsSnapshot {
-    pub has_credits: bool,
-    pub unlimited: bool,
-    pub balance: Option<String>,
-}
-
-/// Detail rows are retained for the planned reset-details screen. The compact summary currently
-/// consumes only `expires_at`.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct RateLimitResetCredit {
-    pub id: Option<String>,
-    pub reset_type: Option<String>,
-    pub status: Option<String>,
-    pub granted_at: Option<i64>,
-    pub expires_at: Option<i64>,
-    pub title: Option<String>,
-    pub description: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SpendControlLimitSnapshot {
-    pub limit: Option<String>,
-    pub remaining_percent: Option<f64>,
-    pub resets_at: Option<i64>,
-    pub used: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct RateLimitSnapshot {
-    pub limit_id: Option<String>,
-    pub limit_name: Option<String>,
-    pub individual_limit: Option<SpendControlLimitSnapshot>,
-    pub primary: Option<RateLimitWindow>,
-    pub secondary: Option<RateLimitWindow>,
-    pub credits: Option<CreditsSnapshot>,
-}
-
-#[derive(Debug, Clone)]
-pub struct AccountRateLimits {
-    pub limit_id: Option<String>,
-    pub limit_name: Option<String>,
-    pub individual_limit: Option<SpendControlLimitSnapshot>,
-    pub primary: Option<RateLimitWindow>,
-    pub secondary: Option<RateLimitWindow>,
-    pub credits: Option<CreditsSnapshot>,
-    pub buckets: Vec<RateLimitSnapshot>,
-    pub reset_credits_available: Option<i64>,
-    /// `None` means the backend did not return the optional credit detail rows.
-    pub reset_credits: Option<Vec<RateLimitResetCredit>>,
-}
+pub const FIVE_HOUR_WINDOW_MINS: f64 = 5.0 * 60.0;
+pub const SEVEN_DAY_WINDOW_MINS: f64 = 7.0 * 24.0 * 60.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResetCreditOutcome {
-    Reset,
-    NothingToReset,
-    NoCredit,
-    AlreadyRedeemed,
+pub enum LimitsSourceKind {
+    StatusLine,
+    OAuth,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountUsageSummary {
-    pub lifetime_tokens: Option<u64>,
-    pub peak_daily_tokens: Option<u64>,
-    pub longest_running_turn_sec: Option<u64>,
-    pub current_streak_days: Option<u64>,
-    pub longest_streak_days: Option<u64>,
+impl LimitsSourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::StatusLine => "STATUSLINE",
+            Self::OAuth => "OAUTH",
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DailyUsageBucket {
-    pub start_date: String,
-    pub tokens: u64,
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitWindow {
+    /// Share of the limit used, 0-100.
+    pub used_percent: Option<f64>,
+    pub window_duration_mins: Option<f64>,
+    /// Unix seconds when the window resets.
+    pub resets_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountUsage {
-    pub summary: AccountUsageSummary,
-    /// `None` means the backend did not return the optional daily activity series.
-    pub daily_usage_buckets: Option<Vec<DailyUsageBucket>>,
+/// A limit scoped to one model or surface (for example the weekly limit of
+/// one model family).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitSnapshot {
+    pub limit_name: Option<String>,
+    pub primary: Option<RateLimitWindow>,
+}
+
+/// Paid usage beyond the subscription limits.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtraUsage {
+    pub enabled: bool,
+    pub used_amount: Option<f64>,
+    pub limit_amount: Option<f64>,
+    pub currency: Option<String>,
+    pub used_percent: Option<f64>,
+}
+
+/// Share of the weekly usage by surface (Claude Code, chat, ...).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurfaceShare {
+    pub name: String,
+    pub percent: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountRateLimits {
+    pub source: LimitsSourceKind,
+    /// Unix seconds when the data was captured.
+    pub captured_at: i64,
+    /// Subscription type reported with the credentials ("pro", "max", ...).
+    pub plan: Option<String>,
+    /// Five-hour session window.
+    pub primary: Option<RateLimitWindow>,
+    /// Seven-day window across all models.
+    pub secondary: Option<RateLimitWindow>,
+    /// Scoped weekly limits (per model).
+    pub buckets: Vec<RateLimitSnapshot>,
+    /// Gateway spend limit (status line only).
+    pub spend_limit: Option<RateLimitWindow>,
+    pub extra_usage: Option<ExtraUsage>,
+    pub surfaces: Vec<SurfaceShare>,
+    /// Name of the limit that currently binds, when the server reports it.
+    pub active_limit: Option<String>,
+}
+
+impl AccountRateLimits {
+    pub fn empty(source: LimitsSourceKind, captured_at: i64) -> Self {
+        Self {
+            source,
+            captured_at,
+            plan: None,
+            primary: None,
+            secondary: None,
+            buckets: Vec::new(),
+            spend_limit: None,
+            extra_usage: None,
+            surfaces: Vec::new(),
+            active_limit: None,
+        }
+    }
 }
 
 pub fn normalize_epoch_millis(value: i64) -> i64 {
@@ -105,4 +110,33 @@ pub fn normalize_epoch_millis(value: i64) -> i64 {
     } else {
         value
     }
+}
+
+pub(crate) fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Reads a number that may be encoded as an integer, float, or numeric string.
+pub(crate) fn as_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+        .filter(|number: &f64| number.is_finite())
+}
+
+/// Reads a timestamp given as Unix seconds/milliseconds or an RFC 3339 string
+/// and returns Unix seconds.
+pub(crate) fn as_unix_seconds(value: &Value) -> Option<i64> {
+    if let Some(text) = value.as_str() {
+        return DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|parsed| parsed.timestamp());
+    }
+    let raw = value
+        .as_i64()
+        .or_else(|| value.as_f64().map(|number| number as i64))?;
+    Some(normalize_epoch_millis(raw) / 1000)
 }

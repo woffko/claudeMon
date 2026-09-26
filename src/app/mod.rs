@@ -1,4 +1,4 @@
-use crate::limits::{AccountRateLimits, AccountUsage, ResetCreditOutcome};
+use crate::limits::AccountRateLimits;
 use crate::locale::{DisplayFormatter, DisplayStyle, SystemLocale};
 use crate::read;
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric, UsageZone};
@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, watch};
 
@@ -41,8 +40,10 @@ pub struct Config {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveLimitsMode {
-    Auto,
-    On,
+    /// Read the snapshot written by `claudemon statusline`.
+    StatusLine,
+    /// Poll the OAuth usage endpoint with Claude Code's token (opt-in).
+    OAuth,
     Off,
 }
 
@@ -52,27 +53,89 @@ pub(crate) enum ChartOrientation {
     Horizontal,
 }
 
+/// Sub-view of the APISTAT screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApiStatGrouping {
-    Day,
-    Week,
-    Month,
+pub(crate) enum ApiStatView {
+    Overview,
+    Models,
 }
 
-impl ApiStatGrouping {
+impl ApiStatView {
     fn toggled(self) -> Self {
         match self {
-            Self::Day => Self::Week,
-            Self::Week => Self::Month,
-            Self::Month => Self::Day,
+            Self::Overview => Self::Models,
+            Self::Models => Self::Overview,
+        }
+    }
+
+    fn store_value(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Models => "models",
+        }
+    }
+
+    fn from_store(value: &str) -> Option<Self> {
+        match value {
+            "overview" => Some(Self::Overview),
+            "models" => Some(Self::Models),
+            _ => None,
         }
     }
 }
 
+/// Date range of the APISTAT Models view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ApiStatGraph {
-    Bars,
-    Heat,
+pub(crate) enum ModelsRange {
+    AllTime,
+    Last7Days,
+    Last30Days,
+}
+
+impl ModelsRange {
+    pub(crate) const ALL: [Self; 3] = [Self::AllTime, Self::Last7Days, Self::Last30Days];
+
+    fn cycled(self) -> Self {
+        match self {
+            Self::AllTime => Self::Last7Days,
+            Self::Last7Days => Self::Last30Days,
+            Self::Last30Days => Self::AllTime,
+        }
+    }
+
+    /// Number of trailing days, or `None` for all indexed history.
+    pub(crate) fn days(self) -> Option<usize> {
+        match self {
+            Self::AllTime => None,
+            Self::Last7Days => Some(7),
+            Self::Last30Days => Some(30),
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::AllTime => "All time",
+            Self::Last7Days => "Last 7 days",
+            Self::Last30Days => "Last 30 days",
+        }
+    }
+
+    fn store_value(self) -> &'static str {
+        match self {
+            Self::AllTime => "all",
+            Self::Last7Days => "7d",
+            Self::Last30Days => "30d",
+        }
+    }
+
+    fn from_store(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::AllTime),
+            "7d" => Some(Self::Last7Days),
+            "30d" => Some(Self::Last30Days),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -239,13 +302,8 @@ enum UsageCommand {
 #[derive(Debug)]
 enum AppEvent {
     UsageUpdated(Result<LocalUsageSnapshot>),
-    // Sent once a live limit source is implemented.
-    #[allow(dead_code)]
     LimitsUpdated(Result<AccountRateLimits>),
-    LimitResetConsumed(Result<ResetCreditOutcome>),
-    #[allow(dead_code)]
-    AccountUsageUpdated(Result<AccountUsage>),
-    AccountApiUnavailable {
+    LimitsUnavailable {
         message: String,
         is_error: bool,
     },
@@ -263,7 +321,6 @@ pub(crate) enum ActiveScreen {
     Usage,
     Activity,
     ApiStat,
-    LimitResets,
     Read,
 }
 
@@ -283,23 +340,17 @@ pub(crate) enum UiClickAction {
     SetRange(ChartRange),
     SetUsageZone(UsageZone),
     SetOrientation(ChartOrientation),
-    SetApiStatGrouping(ApiStatGrouping),
-    SetApiStatGraph(ApiStatGraph),
-    SetApiStatOrientation(ChartOrientation),
+    SetApiStatView(ApiStatView),
+    SetModelsRange(ModelsRange),
+    CopyModelsTable,
     ScrollUsageOlder,
     ScrollUsageNewer,
     SetUsageScrollOffset(usize),
-    ScrollApiStatOlder,
-    ScrollApiStatNewer,
-    SetApiStatScrollOffset(usize),
     ScrollActivityOlder,
     ScrollActivityNewer,
     SetActivityScrollOffset(usize),
     DecreaseProjects,
     IncreaseProjects,
-    PromptLimitReset,
-    ConfirmLimitReset,
-    CancelLimitReset,
     PromptQuit,
     CancelQuit,
     ConfirmQuit,
@@ -356,23 +407,11 @@ enum ActivityCommand {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum LimitResetCommand {
-    RefreshLimits,
-    ToggleHelp,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum ApiStatCommand {
     Refresh,
-    ToggleGrouping,
-    ToggleGraph,
-    ToggleOrientation,
-    ScrollOlder,
-    ScrollNewer,
-    PageOlder,
-    PageNewer,
-    ScrollOldest,
-    ScrollNewest,
+    ToggleView,
+    CycleModelsRange,
+    CopyModelsTable,
     ToggleHelp,
 }
 
@@ -380,8 +419,7 @@ fn next_active_screen(screen: ActiveScreen) -> ActiveScreen {
     match screen {
         ActiveScreen::Usage => ActiveScreen::ApiStat,
         ActiveScreen::ApiStat => ActiveScreen::Activity,
-        ActiveScreen::Activity => ActiveScreen::LimitResets,
-        ActiveScreen::LimitResets => ActiveScreen::Read,
+        ActiveScreen::Activity => ActiveScreen::Read,
         ActiveScreen::Read => ActiveScreen::Usage,
     }
 }
@@ -393,17 +431,12 @@ pub(crate) struct AppState {
     pub(crate) range: ChartRange,
     pub(crate) usage_zone: UsageZone,
     pub(crate) orientation: ChartOrientation,
-    pub(crate) api_stat_grouping: ApiStatGrouping,
-    pub(crate) api_stat_graph: ApiStatGraph,
-    pub(crate) api_stat_orientation: ChartOrientation,
+    pub(crate) api_stat_view: ApiStatView,
+    pub(crate) models_range: ModelsRange,
     pub(crate) usage_period_offset: usize,
     pub(crate) usage_visible_periods: usize,
     pub(crate) usage_total_periods: usize,
     pub(crate) usage_scroll_area: Option<Rect>,
-    pub(crate) api_stat_period_offset: usize,
-    pub(crate) api_stat_visible_periods: usize,
-    pub(crate) api_stat_total_periods: usize,
-    pub(crate) api_stat_scroll_area: Option<Rect>,
     pub(crate) activity_project_limit: usize,
     pub(crate) activity_week_offset: usize,
     pub(crate) activity_visible_weeks: usize,
@@ -439,18 +472,11 @@ pub(crate) struct AppState {
     pub(crate) limits_error: Option<String>,
     pub(crate) limits_notice: Option<String>,
     pub(crate) limits_enabled: bool,
-    pub(crate) limit_reset_confirm_open: bool,
-    pub(crate) limit_reset_confirm_yes_selected: bool,
-    pub(crate) limit_reset_in_flight: bool,
-    pub(crate) limit_reset_cooldown_until: Option<i64>,
-    pub(crate) limit_reset_notice: Option<String>,
-    pub(crate) limit_reset_error: Option<String>,
-
-    pub(crate) account_usage: Option<AccountUsage>,
-    pub(crate) account_usage_updated_at: Option<Instant>,
-    pub(crate) account_usage_error: Option<String>,
-    pub(crate) account_usage_notice: Option<String>,
-    pub(crate) account_usage_enabled: bool,
+    pub(crate) live_limits_mode: LiveLimitsMode,
+    /// Transient notice on the APISTAT screen (for example after a copy).
+    pub(crate) api_stat_notice: Option<String>,
+    /// Text to place on the terminal clipboard after the next draw.
+    pub(crate) clipboard_request: Option<String>,
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
 
@@ -458,20 +484,9 @@ const STATE_STORE_SCHEMA_VERSION: u32 = 4;
 const STATE_STORE_FILE_NAME: &str = "state.json";
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 const IDLE_UI_TICK: Duration = Duration::from_secs(1);
-const LIMIT_RESET_COOLDOWN_SECS: i64 = 60 * 60;
-const LIMIT_EXHAUSTED_EPSILON: f64 = 0.01;
-static LIMIT_RESET_ATTEMPT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
 pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
 pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LimitResetButtonState {
-    Enabled,
-    Disabled,
-    Cooldown(u64),
-    InFlight,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedUiState {
@@ -479,9 +494,8 @@ struct PersistedUiState {
     range: ChartRange,
     usage_zone: UsageZone,
     orientation: ChartOrientation,
-    api_stat_grouping: ApiStatGrouping,
-    api_stat_graph: ApiStatGraph,
-    api_stat_orientation: ChartOrientation,
+    api_stat_view: ApiStatView,
+    models_range: ModelsRange,
     activity_project_limit: usize,
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
@@ -489,7 +503,6 @@ struct PersistedUiState {
     accent_theme: AccentTheme,
     bar_fill_mode: BarFillMode,
     skip_quit_confirmation: bool,
-    limit_reset_cooldown_until: Option<i64>,
     history_project_view_mode: crate::read::catalog::ProjectViewMode,
     history_deep_depth: u8,
     history_selected_projects: BTreeSet<String>,
@@ -504,9 +517,8 @@ impl PersistedUiState {
             range: ChartRange::Day,
             usage_zone: UsageZone::Local,
             orientation: ChartOrientation::Horizontal,
-            api_stat_grouping: ApiStatGrouping::Day,
-            api_stat_graph: ApiStatGraph::Bars,
-            api_stat_orientation: ChartOrientation::Vertical,
+            api_stat_view: ApiStatView::Overview,
+            models_range: ModelsRange::Last30Days,
             activity_project_limit: DEFAULT_ACTIVITY_PROJECT_LIMIT,
             workspace_path,
             no_sessions_confirm_dismissed: false,
@@ -514,7 +526,6 @@ impl PersistedUiState {
             accent_theme: AccentTheme::default(),
             bar_fill_mode: BarFillMode::default(),
             skip_quit_confirmation: false,
-            limit_reset_cooldown_until: None,
             history_project_view_mode: crate::read::catalog::ProjectViewMode::Strict,
             history_deep_depth: crate::read::catalog::DEFAULT_DEEP_DEPTH,
             history_selected_projects: BTreeSet::new(),
@@ -529,9 +540,8 @@ impl PersistedUiState {
             range: state.range,
             usage_zone: state.usage_zone,
             orientation: state.orientation,
-            api_stat_grouping: state.api_stat_grouping,
-            api_stat_graph: state.api_stat_graph,
-            api_stat_orientation: state.api_stat_orientation,
+            api_stat_view: state.api_stat_view,
+            models_range: state.models_range,
             activity_project_limit: state.activity_project_limit,
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
@@ -539,9 +549,6 @@ impl PersistedUiState {
             accent_theme: state.accent_theme,
             bar_fill_mode: state.bar_fill_mode,
             skip_quit_confirmation: state.skip_quit_confirmation,
-            limit_reset_cooldown_until: state
-                .limit_reset_cooldown_until
-                .filter(|until| *until > unix_time_seconds()),
             history_project_view_mode: state.read_browser.project_mode(),
             history_deep_depth: state.read_browser.deep_depth(),
             history_selected_projects: state.read_browser.selected_projects().clone(),
@@ -579,16 +586,14 @@ struct StoredGlobalState {
     range: Option<String>,
     usage_zone: Option<String>,
     orientation: Option<String>,
-    api_stat_grouping: Option<String>,
-    api_stat_graph: Option<String>,
-    api_stat_orientation: Option<String>,
+    api_stat_view: Option<String>,
+    models_range: Option<String>,
     activity_project_limit: Option<usize>,
     display_style: Option<String>,
     accent_theme: Option<String>,
     bar_fill_mode: Option<String>,
     #[serde(default)]
     skip_quit_confirmation: bool,
-    limit_reset_cooldown_until: Option<i64>,
     last_workspace_path: Option<String>,
     history_project_view_mode: Option<String>,
     history_deep_depth: Option<u8>,
@@ -622,7 +627,6 @@ async fn run_inner(
     let (evt_tx, mut evt_rx) = mpsc::channel::<AppEvent>(64);
     let (usage_refresh_tx, usage_refresh_rx) = mpsc::channel::<()>(1);
     let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
-    let (limit_reset_tx, limit_reset_rx) = mpsc::channel::<String>(4);
     let (catalog_refresh_tx, catalog_refresh_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let restored_ui_state = load_persisted_ui_state_with_history_depth(
@@ -860,55 +864,50 @@ async fn run_inner(
         });
     }
 
-    // Spawn limits worker. Claude limit sources are not implemented yet, so the
-    // worker reports the unavailable state once and keeps the channels open.
+    // Spawn limits worker: polls the configured limit source. An unavailable
+    // source is reported but polling continues, so a status-line snapshot
+    // that appears later (or a refreshed OAuth token) is picked up.
     {
         let evt_tx = evt_tx.clone();
         let live_limits_mode = config.live_limits_mode;
+        let claude_dir = config.claude_dir.clone();
+        let claudemon_home = config.claudemon_home.clone();
+        let refresh = limits_refresh_interval(live_limits_mode, config.refresh_limits_secs);
         let mut limits_refresh_rx = limits_refresh_rx;
-        let mut limit_reset_rx = limit_reset_rx;
         let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
-            let message = if live_limits_mode == LiveLimitsMode::Off {
-                "Live limits disabled (--live-limits off).".to_string()
-            } else {
-                missing_limits_source_message().to_string()
-            };
-            let is_error = live_limits_mode == LiveLimitsMode::On;
-            if evt_tx
-                .send(AppEvent::AccountApiUnavailable {
-                    message: message.clone(),
-                    is_error,
-                })
-                .await
-                .is_err()
-            {
+            if live_limits_mode == LiveLimitsMode::Off {
+                let _ = evt_tx
+                    .send(AppEvent::LimitsUnavailable {
+                        message: "Live limits disabled (--live-limits off).".to_string(),
+                        is_error: false,
+                    })
+                    .await;
                 return;
             }
+            let mut interval = tokio::time::interval(refresh);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
+                    _ = interval.tick() => {}
                     recv = limits_refresh_rx.recv() => {
                         if recv.is_none() {
                             break;
                         }
-                        let event = AppEvent::AccountApiUnavailable {
-                            message: message.clone(),
-                            is_error,
-                        };
-                        if evt_tx.send(event).await.is_err() {
-                            break;
-                        }
                     }
-                    recv = limit_reset_rx.recv() => {
-                        if recv.is_none() {
-                            break;
-                        }
-                        let result = Err(anyhow!("No limit source supports resets."));
-                        if evt_tx.send(AppEvent::LimitResetConsumed(result)).await.is_err() {
-                            break;
-                        }
-                    }
+                }
+                let claude_dir = claude_dir.clone();
+                let claudemon_home = claudemon_home.clone();
+                let event = tokio::task::spawn_blocking(move || {
+                    read_live_limits(live_limits_mode, &claude_dir, &claudemon_home)
+                })
+                .await
+                .unwrap_or_else(|error| {
+                    AppEvent::LimitsUpdated(Err(anyhow!("Limits worker failed: {error}")))
+                });
+                if evt_tx.send(event).await.is_err() {
+                    break;
                 }
             }
         });
@@ -955,17 +954,12 @@ async fn run_inner(
         range: restored_ui_state.range,
         usage_zone: restored_ui_state.usage_zone,
         orientation: restored_ui_state.orientation,
-        api_stat_grouping: restored_ui_state.api_stat_grouping,
-        api_stat_graph: restored_ui_state.api_stat_graph,
-        api_stat_orientation: restored_ui_state.api_stat_orientation,
+        api_stat_view: restored_ui_state.api_stat_view,
+        models_range: restored_ui_state.models_range,
         usage_period_offset: 0,
         usage_visible_periods: 0,
         usage_total_periods: 0,
         usage_scroll_area: None,
-        api_stat_period_offset: 0,
-        api_stat_visible_periods: 0,
-        api_stat_total_periods: 0,
-        api_stat_scroll_area: None,
         activity_project_limit: restored_ui_state.activity_project_limit,
         activity_week_offset: 0,
         activity_visible_weeks: 0,
@@ -999,19 +993,9 @@ async fn run_inner(
         limits_error: None,
         limits_notice: None,
         limits_enabled: true,
-        limit_reset_confirm_open: false,
-        limit_reset_confirm_yes_selected: false,
-        limit_reset_in_flight: false,
-        limit_reset_cooldown_until: restored_ui_state
-            .limit_reset_cooldown_until
-            .filter(|until| *until > unix_time_seconds()),
-        limit_reset_notice: None,
-        limit_reset_error: None,
-        account_usage: None,
-        account_usage_updated_at: None,
-        account_usage_error: None,
-        account_usage_notice: None,
-        account_usage_enabled: true,
+        live_limits_mode: config.live_limits_mode,
+        api_stat_notice: None,
+        clipboard_request: None,
         read_browser,
     };
 
@@ -1033,9 +1017,7 @@ async fn run_inner(
                         input,
                         &usage_refresh_tx,
                         &limits_refresh_tx,
-                        &limit_reset_tx,
                         &catalog_refresh_tx,
-                        &config.claudemon_home,
                     )? {
                         InputOutcome::Continue(should_redraw) => {
                             dirty |= should_redraw;
@@ -1060,6 +1042,11 @@ async fn run_inner(
 
         if dirty {
             terminal.draw(|f| crate::ui::render(f, &mut state))?;
+        }
+        if let Some(text) = state.clipboard_request.take() {
+            if let Err(error) = crate::ui::copy_to_terminal_clipboard(&text) {
+                state.api_stat_notice = Some(format!("Copy failed: {error}"));
+            }
         }
 
         let current_ui_state = PersistedUiState::from_app_state(&state);
@@ -1128,109 +1115,12 @@ fn clear_scan_cache_files(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn new_limit_reset_idempotency_key() -> String {
-    let sequence = LIMIT_RESET_ATTEMPT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default();
-    format!("claudemon-{}-{nanos}-{sequence}", std::process::id())
-}
-
-fn begin_limit_reset(
-    state: &mut AppState,
-    limit_reset_tx: &mpsc::Sender<String>,
-    claudemon_home: &Path,
-) -> Result<bool> {
-    if state.limit_reset_button_state() != LimitResetButtonState::Enabled {
-        state.limit_reset_confirm_open = false;
-        state.limit_reset_confirm_yes_selected = false;
-        return Ok(true);
-    }
-
-    state.limit_reset_confirm_open = false;
-    state.limit_reset_confirm_yes_selected = false;
-    state.limit_reset_in_flight = true;
-    state.limit_reset_cooldown_until =
-        Some(unix_time_seconds().saturating_add(LIMIT_RESET_COOLDOWN_SECS));
-    state.limit_reset_notice = Some("Reset request queued; waiting for the server.".to_string());
-    state.limit_reset_error = None;
-
-    // Persist the safety lock before the irreversible request. If persistence fails, do not
-    // consume a credit: an immediate restart could otherwise permit an accidental retry.
-    if let Err(error) =
-        save_persisted_ui_state(claudemon_home, &PersistedUiState::from_app_state(state))
-    {
-        state.limit_reset_in_flight = false;
-        state.limit_reset_cooldown_until = None;
-        state.limit_reset_notice = None;
-        state.limit_reset_error = Some(format!("Unable to save reset cooldown: {error}"));
-        return Ok(true);
-    }
-
-    let idempotency_key = new_limit_reset_idempotency_key();
-    if let Err(error) = limit_reset_tx.try_send(idempotency_key) {
-        state.limit_reset_in_flight = false;
-        state.limit_reset_cooldown_until = None;
-        state.limit_reset_notice = None;
-        state.limit_reset_error = Some(format!("Unable to queue reset request: {error}"));
-        let _ = save_persisted_ui_state(claudemon_home, &PersistedUiState::from_app_state(state));
-    }
-    Ok(true)
-}
-
-fn handle_limit_reset_confirmation_input(
-    state: &mut AppState,
-    event: Event,
-    limit_reset_tx: &mpsc::Sender<String>,
-    claudemon_home: &Path,
-) -> Result<InputOutcome> {
-    let finish = |state: &mut AppState, confirmed: bool| -> Result<InputOutcome> {
-        if confirmed {
-            begin_limit_reset(state, limit_reset_tx, claudemon_home)?;
-        } else {
-            state.limit_reset_confirm_open = false;
-            state.limit_reset_confirm_yes_selected = false;
-        }
-        Ok(InputOutcome::Continue(true))
-    };
-
-    match event {
-        Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
-            match ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row) {
-                Some(UiClickAction::ConfirmLimitReset) => finish(state, true),
-                Some(UiClickAction::CancelLimitReset) => finish(state, false),
-                _ => Ok(InputOutcome::Continue(false)),
-            }
-        }
-        Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
-            (KeyCode::Char('y'), _) | (KeyCode::Char('Y'), _) => finish(state, true),
-            (KeyCode::Enter, _) => finish(state, state.limit_reset_confirm_yes_selected),
-            (KeyCode::Left, _) | (KeyCode::Right, _) | (KeyCode::Tab, _) => {
-                state.limit_reset_confirm_yes_selected = !state.limit_reset_confirm_yes_selected;
-                Ok(InputOutcome::Continue(true))
-            }
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => Ok(InputOutcome::Quit),
-            (KeyCode::Esc, _)
-            | (KeyCode::Char('n'), _)
-            | (KeyCode::Char('N'), _)
-            | (KeyCode::Char('q'), _)
-            | (KeyCode::Char('Q'), _) => finish(state, false),
-            _ => Ok(InputOutcome::Continue(false)),
-        },
-        Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
-        _ => Ok(InputOutcome::Continue(false)),
-    }
-}
-
 fn handle_input_event(
     state: &mut AppState,
     event: Event,
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
-    limit_reset_tx: &mpsc::Sender<String>,
     catalog_refresh_tx: &mpsc::Sender<()>,
-    claudemon_home: &Path,
 ) -> Result<InputOutcome> {
     if state.history_catalog_scan_prompt {
         return match event {
@@ -1278,10 +1168,6 @@ fn handle_input_event(
             Event::Resize(_, _) => Ok(InputOutcome::Continue(true)),
             _ => Ok(InputOutcome::Continue(false)),
         };
-    }
-
-    if state.limit_reset_confirm_open {
-        return handle_limit_reset_confirmation_input(state, event, limit_reset_tx, claudemon_home);
     }
 
     if let Some(desired_skip_confirmation) = state.quit_preference_prompt {
@@ -1429,18 +1315,6 @@ fn handle_input_event(
                     };
                     handle_activity_command(state, command, usage_refresh_tx, limits_refresh_tx)
                 }
-                ActiveScreen::ApiStat
-                    if state
-                        .api_stat_scroll_area
-                        .is_some_and(|area| rect_contains(area, mouse.column, mouse.row)) =>
-                {
-                    let command = if older {
-                        ApiStatCommand::ScrollOlder
-                    } else {
-                        ApiStatCommand::ScrollNewer
-                    };
-                    handle_api_stat_command(state, command, limits_refresh_tx)
-                }
                 _ => false,
             };
             if changed {
@@ -1483,7 +1357,13 @@ fn handle_input_event(
                 return Ok(InputOutcome::Continue(true));
             }
             (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(InputOutcome::Quit),
-            (KeyCode::Char('s'), _) | (KeyCode::Char('S'), _) | (KeyCode::F(2), _) => {
+            (KeyCode::Char('s'), modifiers) | (KeyCode::Char('S'), modifiers)
+                if !modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                state.active_screen = next_active_screen(state.active_screen);
+                return Ok(InputOutcome::Continue(true));
+            }
+            (KeyCode::F(2), _) => {
                 state.active_screen = next_active_screen(state.active_screen);
                 return Ok(InputOutcome::Continue(true));
             }
@@ -1530,13 +1410,6 @@ fn handle_input_event(
                 return Ok(InputOutcome::Continue(false));
             };
             let dirty = handle_api_stat_command(state, command, limits_refresh_tx);
-            Ok(InputOutcome::Continue(dirty))
-        }
-        ActiveScreen::LimitResets => {
-            let Some(command) = map_event_to_limit_reset_cmd(event) else {
-                return Ok(InputOutcome::Continue(false));
-            };
-            let dirty = handle_limit_reset_command(state, command, limits_refresh_tx);
             Ok(InputOutcome::Continue(dirty))
         }
         ActiveScreen::Read => Ok(InputOutcome::Continue(read::tui::handle_event(
@@ -1652,29 +1525,21 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             }
             changed
         }
-        UiClickAction::SetApiStatGrouping(grouping) => {
-            let changed = state.api_stat_grouping != grouping;
-            state.api_stat_grouping = grouping;
-            if changed {
-                state.api_stat_period_offset = 0;
-            }
+        UiClickAction::SetApiStatView(view) => {
+            state.api_stat_notice = None;
+            let changed = state.api_stat_view != view;
+            state.api_stat_view = view;
             changed
         }
-        UiClickAction::SetApiStatGraph(graph) => {
-            let changed = state.api_stat_graph != graph;
-            state.api_stat_graph = graph;
-            if changed {
-                state.api_stat_period_offset = 0;
-            }
+        UiClickAction::SetModelsRange(range) => {
+            state.api_stat_notice = None;
+            let changed = state.models_range != range;
+            state.models_range = range;
             changed
         }
-        UiClickAction::SetApiStatOrientation(orientation) => {
-            let changed = state.api_stat_orientation != orientation;
-            state.api_stat_orientation = orientation;
-            if changed {
-                state.api_stat_period_offset = 0;
-            }
-            changed
+        UiClickAction::CopyModelsTable => {
+            copy_models_table(state);
+            true
         }
         UiClickAction::ScrollUsageOlder => scroll_usage_periods(state, 1, true),
         UiClickAction::ScrollUsageNewer => scroll_usage_periods(state, 1, false),
@@ -1686,18 +1551,6 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             );
             let changed = state.usage_period_offset != next;
             state.usage_period_offset = next;
-            changed
-        }
-        UiClickAction::ScrollApiStatOlder => scroll_api_stat_periods(state, 1, true),
-        UiClickAction::ScrollApiStatNewer => scroll_api_stat_periods(state, 1, false),
-        UiClickAction::SetApiStatScrollOffset(offset) => {
-            let next = offset.min(
-                state
-                    .api_stat_total_periods
-                    .saturating_sub(state.api_stat_visible_periods),
-            );
-            let changed = state.api_stat_period_offset != next;
-            state.api_stat_period_offset = next;
             changed
         }
         UiClickAction::ScrollActivityOlder => scroll_activity_weeks(state, 1, true),
@@ -1730,15 +1583,6 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             state.activity_project_limit = next;
             changed
         }
-        UiClickAction::PromptLimitReset => {
-            if state.limit_reset_button_state() != LimitResetButtonState::Enabled {
-                return false;
-            }
-            state.limit_reset_confirm_open = true;
-            state.limit_reset_confirm_yes_selected = false;
-            true
-        }
-        UiClickAction::ConfirmLimitReset | UiClickAction::CancelLimitReset => false,
         UiClickAction::PromptQuit => {
             state.quit_confirm_open = true;
             state.quit_confirm_yes_selected = false;
@@ -1840,41 +1684,17 @@ fn map_event_to_activity_cmd(event: Event) -> Option<ActivityCommand> {
     }
 }
 
-fn map_event_to_limit_reset_cmd(event: Event) -> Option<LimitResetCommand> {
-    match event {
-        Event::Key(key) => {
-            if key.kind != KeyEventKind::Press {
-                return None;
-            }
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => {
-                    Some(LimitResetCommand::RefreshLimits)
-                }
-                (KeyCode::Char('?'), _) => Some(LimitResetCommand::ToggleHelp),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 fn map_event_to_api_stat_cmd(event: Event) -> Option<ApiStatCommand> {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => match (key.code, key.modifiers) {
+            (KeyCode::Char('s'), KeyModifiers::CONTROL) => Some(ApiStatCommand::CopyModelsTable),
             (KeyCode::Char('r'), _) | (KeyCode::F(5), _) => Some(ApiStatCommand::Refresh),
-            (KeyCode::Char('g'), _) | (KeyCode::Char('G'), _) => {
-                Some(ApiStatCommand::ToggleGrouping)
+            (KeyCode::Char('v'), _) | (KeyCode::Char('V'), _) | (KeyCode::Tab, _) => {
+                Some(ApiStatCommand::ToggleView)
             }
-            (KeyCode::Char('b'), _) | (KeyCode::Char('B'), _) => Some(ApiStatCommand::ToggleGraph),
-            (KeyCode::Char('f'), _) | (KeyCode::Char('F'), _) => {
-                Some(ApiStatCommand::ToggleOrientation)
+            (KeyCode::Char('d'), _) | (KeyCode::Char('D'), _) => {
+                Some(ApiStatCommand::CycleModelsRange)
             }
-            (KeyCode::Left, _) | (KeyCode::Up, _) => Some(ApiStatCommand::ScrollOlder),
-            (KeyCode::Right, _) | (KeyCode::Down, _) => Some(ApiStatCommand::ScrollNewer),
-            (KeyCode::PageUp, _) => Some(ApiStatCommand::PageOlder),
-            (KeyCode::PageDown, _) => Some(ApiStatCommand::PageNewer),
-            (KeyCode::Home, _) => Some(ApiStatCommand::ScrollOldest),
-            (KeyCode::End, _) => Some(ApiStatCommand::ScrollNewest),
             (KeyCode::Char('?'), _) => Some(ApiStatCommand::ToggleHelp),
             _ => None,
         },
@@ -2070,99 +1890,56 @@ fn scroll_activity_weeks(state: &mut AppState, amount: usize, older: bool) -> bo
     changed
 }
 
-fn handle_limit_reset_command(
-    state: &mut AppState,
-    cmd: LimitResetCommand,
-    limits_refresh_tx: &mpsc::Sender<()>,
-) -> bool {
-    match cmd {
-        LimitResetCommand::ToggleHelp => {
-            state.show_help = !state.show_help;
-            true
-        }
-        LimitResetCommand::RefreshLimits => {
-            let _ = limits_refresh_tx.try_send(());
-            true
-        }
-    }
-}
-
 fn handle_api_stat_command(
     state: &mut AppState,
     cmd: ApiStatCommand,
-    account_refresh_tx: &mpsc::Sender<()>,
+    limits_refresh_tx: &mpsc::Sender<()>,
 ) -> bool {
+    // A copy notice lasts until the next APISTAT action.
+    state.api_stat_notice = None;
     match cmd {
         ApiStatCommand::ToggleHelp => {
             state.show_help = !state.show_help;
             true
         }
         ApiStatCommand::Refresh => {
-            let _ = account_refresh_tx.try_send(());
+            let _ = limits_refresh_tx.try_send(());
             true
         }
-        ApiStatCommand::ToggleGrouping => {
-            if state.api_stat_graph == ApiStatGraph::Heat {
-                return false;
-            }
-            state.api_stat_grouping = state.api_stat_grouping.toggled();
-            state.api_stat_period_offset = 0;
+        ApiStatCommand::ToggleView => {
+            state.api_stat_view = state.api_stat_view.toggled();
             true
         }
-        ApiStatCommand::ToggleGraph => {
-            state.api_stat_graph = match state.api_stat_graph {
-                ApiStatGraph::Bars => ApiStatGraph::Heat,
-                ApiStatGraph::Heat => ApiStatGraph::Bars,
-            };
-            state.api_stat_period_offset = 0;
+        ApiStatCommand::CycleModelsRange => {
+            state.models_range = state.models_range.cycled();
             true
         }
-        ApiStatCommand::ToggleOrientation => {
-            if state.api_stat_graph == ApiStatGraph::Heat {
-                return false;
-            }
-            state.api_stat_orientation = match state.api_stat_orientation {
-                ChartOrientation::Vertical => ChartOrientation::Horizontal,
-                ChartOrientation::Horizontal => ChartOrientation::Vertical,
-            };
-            state.api_stat_period_offset = 0;
+        ApiStatCommand::CopyModelsTable => {
+            copy_models_table(state);
             true
-        }
-        ApiStatCommand::ScrollOlder => scroll_api_stat_periods(state, 1, true),
-        ApiStatCommand::ScrollNewer => scroll_api_stat_periods(state, 1, false),
-        ApiStatCommand::PageOlder => {
-            scroll_api_stat_periods(state, state.api_stat_visible_periods.max(1), true)
-        }
-        ApiStatCommand::PageNewer => {
-            scroll_api_stat_periods(state, state.api_stat_visible_periods.max(1), false)
-        }
-        ApiStatCommand::ScrollOldest => {
-            let next = state
-                .api_stat_total_periods
-                .saturating_sub(state.api_stat_visible_periods);
-            let changed = state.api_stat_period_offset != next;
-            state.api_stat_period_offset = next;
-            changed
-        }
-        ApiStatCommand::ScrollNewest => {
-            let changed = state.api_stat_period_offset != 0;
-            state.api_stat_period_offset = 0;
-            changed
         }
     }
 }
 
-fn scroll_api_stat_periods(state: &mut AppState, amount: usize, older: bool) -> bool {
-    let next = scrolled_period_offset(
-        state.api_stat_period_offset,
-        state.api_stat_total_periods,
-        state.api_stat_visible_periods,
-        amount,
-        older,
-    );
-    let changed = next != state.api_stat_period_offset;
-    state.api_stat_period_offset = next;
-    changed
+/// Queues the Models table for the terminal clipboard (OSC 52).
+fn copy_models_table(state: &mut AppState) {
+    let text = state.usage.as_ref().map(|snapshot| {
+        crate::ui::apistat::models_table_text(
+            snapshot,
+            state.usage_zone,
+            state.models_range,
+            state.formatter(),
+        )
+    });
+    match text {
+        Some(text) if !text.is_empty() => {
+            state.clipboard_request = Some(text);
+            state.api_stat_notice = Some("Copied the models table to the clipboard.".to_string());
+        }
+        _ => {
+            state.api_stat_notice = Some("Nothing to copy yet.".to_string());
+        }
+    }
 }
 
 fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
@@ -2186,19 +1963,15 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             }
             true
         }
-        AppEvent::AccountApiUnavailable { message, is_error } => {
+        AppEvent::LimitsUnavailable { message, is_error } => {
             state.limits_enabled = false;
-            state.account_usage_enabled = false;
+            state.limits = None;
             if is_error {
-                state.limits_error = Some(message.clone());
+                state.limits_error = Some(message);
                 state.limits_notice = None;
-                state.account_usage_error = Some(message);
-                state.account_usage_notice = None;
             } else {
                 state.limits_error = None;
-                state.limits_notice = Some(message.clone());
-                state.account_usage_error = None;
-                state.account_usage_notice = Some(message);
+                state.limits_notice = Some(message);
             }
             true
         }
@@ -2213,57 +1986,6 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
                 }
                 Err(err) => {
                     state.limits_error = Some(err.to_string());
-                }
-            }
-            true
-        }
-        AppEvent::LimitResetConsumed(res) => {
-            state.limit_reset_in_flight = false;
-            match res {
-                Ok(ResetCreditOutcome::Reset) => {
-                    state.limit_reset_notice =
-                        Some("Limit reset accepted; refreshing server statistics.".to_string());
-                    state.limit_reset_error = None;
-                }
-                Ok(ResetCreditOutcome::AlreadyRedeemed) => {
-                    state.limit_reset_notice = Some(
-                        "This reset attempt was already redeemed; refreshing server statistics."
-                            .to_string(),
-                    );
-                    state.limit_reset_error = None;
-                }
-                Ok(ResetCreditOutcome::NothingToReset) => {
-                    state.limit_reset_cooldown_until = None;
-                    state.limit_reset_notice =
-                        Some("The server reports that no limit is eligible for reset.".to_string());
-                    state.limit_reset_error = None;
-                }
-                Ok(ResetCreditOutcome::NoCredit) => {
-                    state.limit_reset_cooldown_until = None;
-                    state.limit_reset_notice =
-                        Some("No reset credit is currently available.".to_string());
-                    state.limit_reset_error = None;
-                }
-                Err(error) => {
-                    // Keep the cooldown after an ambiguous transport/server failure: the backend
-                    // may have consumed the credit even when the response did not arrive.
-                    state.limit_reset_notice = None;
-                    state.limit_reset_error = Some(format!("Limit reset failed: {error}"));
-                }
-            }
-            true
-        }
-        AppEvent::AccountUsageUpdated(res) => {
-            match res {
-                Ok(usage) => {
-                    state.account_usage_enabled = true;
-                    state.account_usage = Some(usage);
-                    state.account_usage_error = None;
-                    state.account_usage_notice = None;
-                    state.account_usage_updated_at = Some(Instant::now());
-                }
-                Err(err) => {
-                    state.account_usage_error = Some(err.to_string());
                 }
             }
             true
@@ -2293,8 +2015,39 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
     }
 }
 
-fn missing_limits_source_message() -> &'static str {
-    "No live limit source is configured yet; usage/history still work."
+/// Setup hint shown until `claudemon statusline` has recorded a snapshot.
+pub(crate) const STATUSLINE_SETUP_HINT: &str = "No status-line snapshot yet. Set Claude Code's statusLine command to `claudemon statusline` (see README), or run with --live-limits oauth.";
+
+fn limits_refresh_interval(mode: LiveLimitsMode, configured_secs: u64) -> Duration {
+    match mode {
+        // Reading the local snapshot is cheap; follow Claude Code closely.
+        LiveLimitsMode::StatusLine => Duration::from_secs(configured_secs.clamp(5, 15)),
+        LiveLimitsMode::OAuth => {
+            Duration::from_secs(configured_secs.max(crate::limits::oauth::MIN_REFRESH_SECS))
+        }
+        LiveLimitsMode::Off => Duration::from_secs(configured_secs.max(1)),
+    }
+}
+
+/// Reads the configured limit source. Blocking.
+fn read_live_limits(mode: LiveLimitsMode, claude_dir: &Path, claudemon_home: &Path) -> AppEvent {
+    match mode {
+        LiveLimitsMode::StatusLine => {
+            match crate::limits::statusline::load(claudemon_home, crate::limits::unix_now()) {
+                Ok(Some(limits)) => AppEvent::LimitsUpdated(Ok(limits)),
+                Ok(None) => AppEvent::LimitsUnavailable {
+                    message: STATUSLINE_SETUP_HINT.to_string(),
+                    is_error: false,
+                },
+                Err(error) => AppEvent::LimitsUpdated(Err(error)),
+            }
+        }
+        LiveLimitsMode::OAuth => AppEvent::LimitsUpdated(crate::limits::oauth::fetch(claude_dir)),
+        LiveLimitsMode::Off => AppEvent::LimitsUnavailable {
+            message: "Live limits disabled (--live-limits off).".to_string(),
+            is_error: false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -2339,20 +2092,21 @@ fn load_persisted_ui_state_with_history_depth(
             state.orientation = orientation;
         }
     }
-    if let Some(grouping_text) = store.global.api_stat_grouping.as_deref() {
-        if let Some(grouping) = api_stat_grouping_from_store(grouping_text) {
-            state.api_stat_grouping = grouping;
-        }
+    if let Some(view) = store
+        .global
+        .api_stat_view
+        .as_deref()
+        .and_then(ApiStatView::from_store)
+    {
+        state.api_stat_view = view;
     }
-    if let Some(graph_text) = store.global.api_stat_graph.as_deref() {
-        if let Some(graph) = api_stat_graph_from_store(graph_text) {
-            state.api_stat_graph = graph;
-        }
-    }
-    if let Some(orientation_text) = store.global.api_stat_orientation.as_deref() {
-        if let Some(orientation) = chart_orientation_from_store(orientation_text) {
-            state.api_stat_orientation = orientation;
-        }
+    if let Some(range) = store
+        .global
+        .models_range
+        .as_deref()
+        .and_then(ModelsRange::from_store)
+    {
+        state.models_range = range;
     }
     if let Some(limit) = store.global.activity_project_limit {
         state.activity_project_limit =
@@ -2374,10 +2128,6 @@ fn load_persisted_ui_state_with_history_depth(
         }
     }
     state.skip_quit_confirmation = store.global.skip_quit_confirmation;
-    state.limit_reset_cooldown_until = store
-        .global
-        .limit_reset_cooldown_until
-        .filter(|until| *until > unix_time_seconds());
     if let Some(mode_text) = store.global.history_project_view_mode.as_deref() {
         if let Some(mode) = crate::read::catalog::ProjectViewMode::from_store(mode_text) {
             state.history_project_view_mode = mode;
@@ -2427,11 +2177,8 @@ fn save_persisted_ui_state(claudemon_home: &Path, state: &PersistedUiState) -> R
     store.global.range = Some(chart_range_to_store(state.range).to_string());
     store.global.usage_zone = Some(usage_zone_to_store(state.usage_zone).to_string());
     store.global.orientation = Some(chart_orientation_to_store(state.orientation).to_string());
-    store.global.api_stat_grouping =
-        Some(api_stat_grouping_to_store(state.api_stat_grouping).to_string());
-    store.global.api_stat_graph = Some(api_stat_graph_to_store(state.api_stat_graph).to_string());
-    store.global.api_stat_orientation =
-        Some(chart_orientation_to_store(state.api_stat_orientation).to_string());
+    store.global.api_stat_view = Some(state.api_stat_view.store_value().to_string());
+    store.global.models_range = Some(state.models_range.store_value().to_string());
     store.global.activity_project_limit = Some(
         state
             .activity_project_limit
@@ -2441,9 +2188,6 @@ fn save_persisted_ui_state(claudemon_home: &Path, state: &PersistedUiState) -> R
     store.global.accent_theme = Some(state.accent_theme.store_value().to_string());
     store.global.bar_fill_mode = Some(state.bar_fill_mode.store_value().to_string());
     store.global.skip_quit_confirmation = state.skip_quit_confirmation;
-    store.global.limit_reset_cooldown_until = state
-        .limit_reset_cooldown_until
-        .filter(|until| *until > now);
     store.global.history_project_view_mode =
         Some(state.history_project_view_mode.store_value().to_string());
     store.global.history_deep_depth = Some(
@@ -2573,38 +2317,6 @@ fn chart_orientation_from_store(value: &str) -> Option<ChartOrientation> {
     }
 }
 
-fn api_stat_grouping_to_store(grouping: ApiStatGrouping) -> &'static str {
-    match grouping {
-        ApiStatGrouping::Day => "day",
-        ApiStatGrouping::Week => "week",
-        ApiStatGrouping::Month => "month",
-    }
-}
-
-fn api_stat_grouping_from_store(value: &str) -> Option<ApiStatGrouping> {
-    match value {
-        "day" => Some(ApiStatGrouping::Day),
-        "week" => Some(ApiStatGrouping::Week),
-        "month" => Some(ApiStatGrouping::Month),
-        _ => None,
-    }
-}
-
-fn api_stat_graph_to_store(graph: ApiStatGraph) -> &'static str {
-    match graph {
-        ApiStatGraph::Bars => "bars",
-        ApiStatGraph::Heat => "heat",
-    }
-}
-
-fn api_stat_graph_from_store(value: &str) -> Option<ApiStatGraph> {
-    match value {
-        "bars" => Some(ApiStatGraph::Bars),
-        "heat" => Some(ApiStatGraph::Heat),
-        _ => None,
-    }
-}
-
 fn unix_time_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2634,85 +2346,12 @@ impl AppState {
         let updated_at = self.limits_updated_at?;
         Some(crate::ui::format_updated_label(updated_at))
     }
-
-    pub(crate) fn account_usage_updated_label(&self) -> Option<String> {
-        let updated_at = self.account_usage_updated_at?;
-        Some(crate::ui::format_updated_label(updated_at))
-    }
-
-    pub(crate) fn limit_reset_button_state(&self) -> LimitResetButtonState {
-        if self.limit_reset_in_flight {
-            return LimitResetButtonState::InFlight;
-        }
-        let now = unix_time_seconds();
-        if let Some(remaining) = self
-            .limit_reset_cooldown_until
-            .and_then(|until| until.checked_sub(now))
-            .filter(|remaining| *remaining > 0)
-        {
-            return LimitResetButtonState::Cooldown(remaining as u64);
-        }
-        if self.limits_enabled && self.limits.as_ref().is_some_and(limit_reset_is_available) {
-            LimitResetButtonState::Enabled
-        } else {
-            LimitResetButtonState::Disabled
-        }
-    }
-
-    pub(crate) fn limit_reset_disabled_reason(&self) -> &'static str {
-        if !self.limits_enabled || self.limits.is_none() {
-            "Limits are unavailable."
-        } else if self
-            .limits
-            .as_ref()
-            .and_then(|limits| limits.reset_credits_available)
-            .unwrap_or(0)
-            <= 0
-        {
-            "No reset credits are available."
-        } else {
-            "Reset becomes available when a limit reaches 0% remaining."
-        }
-    }
-}
-
-fn limit_reset_is_available(limits: &AccountRateLimits) -> bool {
-    limits.reset_credits_available.unwrap_or(0) > 0 && account_has_exhausted_limit(limits)
-}
-
-fn account_has_exhausted_limit(limits: &AccountRateLimits) -> bool {
-    snapshot_has_exhausted_limit(
-        limits.primary.as_ref(),
-        limits.secondary.as_ref(),
-        limits.individual_limit.as_ref(),
-    ) || limits.buckets.iter().any(|bucket| {
-        snapshot_has_exhausted_limit(
-            bucket.primary.as_ref(),
-            bucket.secondary.as_ref(),
-            bucket.individual_limit.as_ref(),
-        )
-    })
-}
-
-fn snapshot_has_exhausted_limit(
-    primary: Option<&crate::limits::RateLimitWindow>,
-    secondary: Option<&crate::limits::RateLimitWindow>,
-    individual: Option<&crate::limits::SpendControlLimitSnapshot>,
-) -> bool {
-    [primary, secondary].into_iter().flatten().any(|window| {
-        window
-            .used_percent
-            .is_some_and(|used| used.is_finite() && used >= 100.0 - LIMIT_EXHAUSTED_EPSILON)
-    }) || individual.is_some_and(|limit| {
-        limit
-            .remaining_percent
-            .is_some_and(|remaining| remaining.is_finite() && remaining <= LIMIT_EXHAUSTED_EPSILON)
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -2869,56 +2508,6 @@ mod tests {
         assert!(!should_continue_scan_catch_up(0, 10, 1_000, Some((9, 900))));
     }
 
-    fn reset_test_limits(used_percent: Option<f64>, available: i64) -> AccountRateLimits {
-        AccountRateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            individual_limit: None,
-            primary: Some(crate::limits::RateLimitWindow {
-                used_percent,
-                window_duration_mins: Some(300.0),
-                resets_at: None,
-            }),
-            secondary: None,
-            credits: None,
-            buckets: Vec::new(),
-            reset_credits_available: Some(available),
-            reset_credits: None,
-        }
-    }
-
-    #[test]
-    fn reset_requires_both_a_credit_and_an_exhausted_limit() {
-        assert!(limit_reset_is_available(&reset_test_limits(
-            Some(99.999),
-            1
-        )));
-        assert!(!limit_reset_is_available(&reset_test_limits(Some(99.0), 1)));
-        assert!(!limit_reset_is_available(&reset_test_limits(
-            Some(100.0),
-            0
-        )));
-    }
-
-    #[test]
-    fn reset_detects_an_exhausted_individual_limit_in_a_bucket() {
-        let mut limits = reset_test_limits(Some(20.0), 1);
-        limits.buckets.push(crate::limits::RateLimitSnapshot {
-            limit_id: Some("monthly".to_string()),
-            limit_name: None,
-            individual_limit: Some(crate::limits::SpendControlLimitSnapshot {
-                limit: None,
-                remaining_percent: Some(0.0),
-                resets_at: None,
-                used: None,
-            }),
-            primary: None,
-            secondary: None,
-            credits: None,
-        });
-        assert!(limit_reset_is_available(&limits));
-    }
-
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let unique = format!(
             "{}-{}-{}",
@@ -2947,10 +2536,6 @@ mod tests {
         );
         assert_eq!(
             next_active_screen(ActiveScreen::Activity),
-            ActiveScreen::LimitResets
-        );
-        assert_eq!(
-            next_active_screen(ActiveScreen::LimitResets),
             ActiveScreen::Read
         );
         assert_eq!(next_active_screen(ActiveScreen::Read), ActiveScreen::Usage);
@@ -3037,21 +2622,6 @@ mod tests {
     }
 
     #[test]
-    fn active_reset_cooldown_round_trips_through_state_store() {
-        let claudemon_home = make_temp_dir("limit-reset-cooldown");
-        let mut state = PersistedUiState::default_for_workspace(None);
-        let cooldown_until = unix_time_seconds().saturating_add(3_600);
-        state.limit_reset_cooldown_until = Some(cooldown_until);
-
-        save_persisted_ui_state(&claudemon_home, &state).expect("save persisted ui state");
-        let loaded =
-            load_persisted_ui_state(&claudemon_home, None).expect("load persisted ui state");
-        assert_eq!(loaded.limit_reset_cooldown_until, Some(cooldown_until));
-
-        let _ = std::fs::remove_dir_all(claudemon_home);
-    }
-
-    #[test]
     fn legacy_state_without_theme_settings_uses_defaults() {
         let claudemon_home = make_temp_dir("legacy-theme-settings");
         let path = claudemon_home.join(STATE_STORE_FILE_NAME);
@@ -3081,18 +2651,37 @@ mod tests {
     fn api_stat_controls_round_trip_through_state_store() {
         let claudemon_home = make_temp_dir("api-stat-controls");
         let mut state = PersistedUiState::default_for_workspace(None);
-        state.api_stat_grouping = ApiStatGrouping::Month;
-        state.api_stat_graph = ApiStatGraph::Heat;
-        state.api_stat_orientation = ChartOrientation::Horizontal;
+        state.api_stat_view = ApiStatView::Models;
+        state.models_range = ModelsRange::AllTime;
 
         save_persisted_ui_state(&claudemon_home, &state).expect("save persisted ui state");
         let loaded =
             load_persisted_ui_state(&claudemon_home, None).expect("load persisted ui state");
-        assert_eq!(loaded.api_stat_grouping, ApiStatGrouping::Month);
-        assert_eq!(loaded.api_stat_graph, ApiStatGraph::Heat);
-        assert_eq!(loaded.api_stat_orientation, ChartOrientation::Horizontal);
+        assert_eq!(loaded.api_stat_view, ApiStatView::Models);
+        assert_eq!(loaded.models_range, ModelsRange::AllTime);
 
         let _ = std::fs::remove_dir_all(claudemon_home);
+    }
+
+    #[test]
+    fn statusline_source_reports_setup_hint_until_a_snapshot_exists() {
+        let claudemon_home = make_temp_dir("limits-source");
+        let claude_dir = make_temp_dir("limits-source-claude");
+        match read_live_limits(LiveLimitsMode::StatusLine, &claude_dir, &claudemon_home) {
+            AppEvent::LimitsUnavailable { message, is_error } => {
+                assert!(!is_error);
+                assert_eq!(message, STATUSLINE_SETUP_HINT);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match read_live_limits(LiveLimitsMode::OAuth, &claude_dir, &claudemon_home) {
+            AppEvent::LimitsUpdated(Err(error)) => {
+                assert!(error.to_string().contains("credentials"), "{error}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(claudemon_home);
+        let _ = std::fs::remove_dir_all(claude_dir);
     }
 
     #[test]

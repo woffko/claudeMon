@@ -174,8 +174,8 @@ Sub-views, switched with a small tab row (like Claude Code `/stats`):
    - "Tokens per Day" chart: one line per model, y-axis with compact
      units (192.3M, 1.5B), x-axis date labels, colored legend
      (`* Opus 5.5 * Opus 5 * Sonnet 5`).
-   - Range selector: All time / Last 7 days / Last 30 days (`r` cycles,
-     mouse clickable).
+   - Range selector: All time / Last 7 days / Last 30 days (`d` cycles,
+     since `r` refreshes everywhere; mouse clickable).
    - Per-model cards in two columns: name, share %,
      `In: ... Out: ...`, `Cache: ... read ... write`.
    - Data source: S2 when an admin key is configured (badge `SERVER`),
@@ -208,7 +208,7 @@ Sub-views, switched with a small tab row (like Claude Code `/stats`):
 - [x] Fresh `CHANGELOG.md`; keep `LICENSE` (Apache-2.0); add `NOTICE`
       crediting the original CoMon authors (ssh4net/CoMon).
 - [x] `cargo check`, `cargo test` (167 passed), `scripts/check-ascii.sh` pass.
-- [ ] First commit.
+- [x] First commit.
 
 ### Phase 2 - USAGE from Claude Code logs (done)
 
@@ -257,20 +257,31 @@ Sub-views, switched with a small tab row (like Claude Code `/stats`):
       tool calls/results, thinking blocks, user turns.
 - [x] Optional: show `claude --resume <session-id>` for the selected session.
 
-### Phase 4 - APISTAT (4-5 days)
+### Phase 4 - APISTAT (done)
 
-- [ ] `LimitsSource` trait in `src/limits`; implementations in this order
-      (D6): S1 (OAuth, opt-in), S5 (status-line
-      bridge subcommand with `--wrap <cmd>`, snapshot in
-      `~/.claudemon/limits.json`, 0600, atomic write, <50 ms, always exit 0).
+- [x] Limit sources in `src/limits`, selected by `--live-limits` /
+      config `live_limits` (`statusline` default, `oauth`, `off`) and
+      polled by the limits worker:
+      S5 status-line bridge `claudemon statusline [--wrap <cmd>]`
+      (snapshot in `~/.claudemon/limits.json`, 0600, atomic write, about
+      30 ms, always exit 0); S1 OAuth usage endpoint (opt-in, token read per
+      request and never stored, `limits[]` preferred over fixed keys,
+      at most one request per minute).
 - [ ] Optional, after S1/S5: `ServerUsageSource` for S2 + S3 (+ S4 if
       confirmed) with pagination, backoff, per-day cache in `claudemon.db`.
-- [ ] Overview sub-view: adapt CoMon limit gauges and server cards; drop
-      Codex reset-credit UI, add extra-usage summary if S1 reports it.
-- [ ] Models sub-view (section 3): multi-series line chart widget (ratatui
-      `Chart` with per-model datasets), range selector, per-model cards,
-      source badge, text copy.
-- [ ] Graceful states: not configured / unavailable / stale (with age).
+- [x] Overview sub-view (LIMITS): 5h, weekly, and per-model weekly gauges
+      with the weekly fair-share marker and reset countdowns, binding limit,
+      extra usage, weekly usage by surface, source and capture age. The
+      Codex reset-credit screen, button, and dialog were removed; the USAGE
+      limits card shows the 5h/weekly windows and the most used model limit.
+- [x] Models sub-view (section 3): multi-series Braille line chart per
+      model, legend, All time / 7 / 30 days selector (`d`, mouse), two-column
+      model cards (share, in/out, cache read/write), `LOCAL` source badge,
+      `ctrl+s` copies the table to the terminal clipboard (OSC 52). Backed by
+      per-model daily four-column usage in the scan cache (schema v2).
+- [x] Graceful states: setup instructions until a status-line snapshot
+      exists, errors kept next to the last good data, stale status-line
+      snapshots (> 15 min) flagged, expired windows shown without a value.
 
 ### Phase 5 - COST (1-2 days)
 

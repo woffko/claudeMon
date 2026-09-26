@@ -7,7 +7,7 @@ mod ui;
 mod usage;
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
@@ -44,6 +44,8 @@ struct UserConfig {
     history_deep_max_depth: u8,
     history_catalog_max_candidates: usize,
     history_catalog_scan_budget_ms: u64,
+    /// Live limit source: "statusline" (default), "oauth", or "off".
+    live_limits: LiveLimitsArg,
 }
 
 impl Default for UserConfig {
@@ -67,6 +69,7 @@ impl Default for UserConfig {
             history_deep_max_depth: read::catalog::MAX_DEEP_DEPTH,
             history_catalog_max_candidates: DEFAULT_HISTORY_CATALOG_MAX_CANDIDATES,
             history_catalog_scan_budget_ms: DEFAULT_HISTORY_CATALOG_SCAN_BUDGET_MS,
+            live_limits: LiveLimitsArg::Statusline,
         }
     }
 }
@@ -154,21 +157,38 @@ fn load_or_bootstrap_user_config(claudemon_home: &Path) -> Result<UserConfig> {
     Ok(config)
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum LiveLimitsArg {
-    Auto,
-    On,
+    /// Read the snapshot recorded by `claudemon statusline` (no credentials).
+    Statusline,
+    /// Poll the OAuth usage endpoint with Claude Code's token (opt-in).
+    Oauth,
+    /// Disable live limits.
     Off,
 }
 
 impl From<LiveLimitsArg> for app::LiveLimitsMode {
     fn from(value: LiveLimitsArg) -> Self {
         match value {
-            LiveLimitsArg::Auto => Self::Auto,
-            LiveLimitsArg::On => Self::On,
+            LiveLimitsArg::Statusline => Self::StatusLine,
+            LiveLimitsArg::Oauth => Self::OAuth,
             LiveLimitsArg::Off => Self::Off,
         }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Status-line bridge: set Claude Code's `statusLine.command` to
+    /// `claudemon statusline`. Records the rate limits Claude Code reports and
+    /// prints a compact status line.
+    Statusline {
+        /// Existing status-line command to run with the same input; its output
+        /// is printed instead of the built-in line.
+        #[arg(long)]
+        wrap: Option<String>,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -178,14 +198,16 @@ impl From<LiveLimitsArg> for app::LiveLimitsMode {
     about = "Claude Code usage + session browser TUI"
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Launch with the session history screen active.
     #[arg(short = 'r', long = "read")]
     read_mode: bool,
 
-    /// Live limits behavior: auto uses a configured limit source if any, on requires one,
-    /// off disables live limits.
-    #[arg(long, value_enum, default_value = "auto")]
-    live_limits: LiveLimitsArg,
+    /// Live limit source (default from config: statusline).
+    #[arg(long, value_enum)]
+    live_limits: Option<LiveLimitsArg>,
 
     /// Override the Claude Code config directory (default: $CLAUDE_CONFIG_DIR or ~/.claude).
     #[arg(long)]
@@ -265,6 +287,13 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(Command::Statusline { wrap }) = &args.command {
+        // Must stay fast and must never fail Claude Code's status line.
+        let home = resolve_claudemon_home(args.claudemon_home.clone());
+        limits::statusline::run(home.as_deref(), wrap.as_deref());
+        return Ok(());
+    }
 
     if args.print_config_path {
         let claudemon_home = resolve_claudemon_home(args.claudemon_home.clone())
@@ -358,7 +387,7 @@ async fn main() -> Result<()> {
     let system_locale = locale::SystemLocale::detect();
 
     let config = app::Config {
-        live_limits_mode: args.live_limits.into(),
+        live_limits_mode: args.live_limits.unwrap_or(user_config.live_limits).into(),
         claudemon_home,
         claude_dir,
         read_sessions_dir: read_config.sessions_dir,

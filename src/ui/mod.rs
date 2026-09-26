@@ -1,6 +1,7 @@
+pub(crate) mod apistat;
+
 use crate::app::{
-    AccentTheme, ActiveScreen, ApiStatGraph, ApiStatGrouping, AppState, BarFillMode,
-    ChartOrientation, LimitResetButtonState, UiClickAction, UiHitTarget,
+    AccentTheme, ActiveScreen, AppState, BarFillMode, ChartOrientation, UiClickAction, UiHitTarget,
 };
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
@@ -114,6 +115,51 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Re
     Ok(())
 }
 
+/// Compact duration for ages and countdowns: "45s", "12m", "3h 5m", "2d 4h".
+pub(crate) fn format_age(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let (days, hours, minutes) = (seconds / 86_400, seconds / 3_600 % 24, seconds / 60 % 60);
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Places `text` on the terminal clipboard with an OSC 52 escape sequence.
+pub(crate) fn copy_to_terminal_clipboard(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for index in 0..4 {
+            if index <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * index)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 pub fn format_updated_label(updated_at: Instant) -> String {
     let secs = updated_at.elapsed().as_secs();
     if secs < 10 {
@@ -149,7 +195,6 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
     state.ui_hit_targets.clear();
     state.usage_scroll_area = None;
     state.activity_scroll_area = None;
-    state.api_stat_scroll_area = None;
     let area = frame.area();
     let (navigation, navigation_targets) = navigation_title(area, state.active_screen);
     state.ui_hit_targets.extend(navigation_targets);
@@ -215,27 +260,8 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
             let footer_height = footer_height(inner.width, state);
             let chunks = usage_screen_layout(inner, footer_height);
 
-            render_api_stat_header(frame, chunks[0], state);
-            render_api_stats(frame, chunks[1], state);
-            render_footer(frame, chunks[2], state);
-
-            if state.show_help {
-                render_help_overlay(frame, area, state.active_screen);
-            }
-        }
-        ActiveScreen::LimitResets => {
-            let footer_height = footer_height(inner.width, state);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3),
-                    Constraint::Min(0),
-                    Constraint::Length(footer_height),
-                ])
-                .split(inner);
-
-            render_limit_resets_header(frame, chunks[0], state);
-            render_limit_resets(frame, chunks[1], state);
+            apistat::render_header(frame, chunks[0], state);
+            apistat::render(frame, chunks[1], state);
             render_footer(frame, chunks[2], state);
 
             if state.show_help {
@@ -261,8 +287,6 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
 
     if state.history_catalog_scan_prompt {
         render_history_catalog_scan_confirmation(frame, area, state);
-    } else if state.limit_reset_confirm_open {
-        render_limit_reset_confirmation(frame, area, state);
     } else if state.quit_confirm_open {
         render_quit_confirmation(frame, area, state);
     } else if state.quit_preference_prompt.is_some() {
@@ -308,10 +332,6 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             Some(UiClickAction::SetScreen(ActiveScreen::Activity)),
         ),
         (
-            " LIMITS ",
-            Some(UiClickAction::SetScreen(ActiveScreen::LimitResets)),
-        ),
-        (
             " HISTORY ",
             Some(UiClickAction::SetScreen(ActiveScreen::Read)),
         ),
@@ -334,7 +354,6 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
         pill("USAGE", active_screen == ActiveScreen::Usage),
         pill("APISTAT", active_screen == ActiveScreen::ApiStat),
         pill("ACTIVITY", active_screen == ActiveScreen::Activity),
-        pill("LIMITS", active_screen == ActiveScreen::LimitResets),
         pill("HISTORY", active_screen == ActiveScreen::Read),
     ]);
     (line, right_aligned_targets(title_area, &segments))
@@ -435,427 +454,9 @@ fn usage_scan_status_label(state: &AppState) -> Option<String> {
     ))
 }
 
-fn render_limit_resets_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let line_area = header_line_area(area);
-    let row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(18)])
-        .split(line_area);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "LIMIT_RESETS",
-            Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        row[0],
-    );
-
-    let updated = state
-        .limits_updated_label()
-        .unwrap_or_else(|| "Updated --".to_string());
-    let right = Paragraph::new(updated).alignment(Alignment::Right);
-    frame.render_widget(right, row[1]);
-}
-
-fn render_api_stat_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let line_area = header_line_area(area);
-    let row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(40)])
-        .split(line_area);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "APISTAT :: SERVER",
-            Style::default().add_modifier(Modifier::BOLD),
-        ))),
-        row[0],
-    );
-
-    let updated = state
-        .account_usage_updated_label()
-        .unwrap_or_else(|| "Updated --".to_string());
-    frame.render_widget(Paragraph::new(updated).alignment(Alignment::Right), row[1]);
-}
-
-fn render_api_stats(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    let unavailable_message = if !state.account_usage_enabled {
-        state
-            .account_usage_error
-            .as_deref()
-            .or(state.account_usage_notice.as_deref())
-    } else if state.account_usage.is_none() {
-        state.account_usage_error.as_deref()
-    } else {
-        None
-    };
-    if let Some(message) = unavailable_message {
-        render_api_stat_message(frame, area, message);
-        return;
-    }
-
-    let Some(account_usage) = state.account_usage.clone() else {
-        render_api_stat_message(frame, area, "Loading account statistics...");
-        return;
-    };
-
-    let reset_summary = reset_summary_text(state);
-    let cards_height = api_stat_cards_height(state, &account_usage, area.width);
-    let controls_height = api_stat_controls_height(reset_summary.as_deref(), area.width);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(controls_height),
-            Constraint::Length(cards_height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-
-    render_api_stat_controls(frame, chunks[0], state, reset_summary.as_deref());
-    let weekly_hover = render_api_stat_cards(frame, chunks[1], state, &account_usage);
-    render_api_stat_chart(frame, chunks[2], &account_usage, state);
-    if let Some(hover) = weekly_hover {
-        render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
-    }
-}
-
-fn api_stat_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width, None))
-}
-
-fn render_api_stat_controls(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &mut AppState,
-    reset_summary: Option<&str>,
-) {
-    let reset_height = reset_summary_height(reset_summary, area.width, None);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
-        .split(area);
-
-    let bars = pill("BARS", state.api_stat_graph == ApiStatGraph::Bars);
-    let heat = pill("HEAT", state.api_stat_graph == ApiStatGraph::Heat);
-    let day = pill("DAY", state.api_stat_grouping == ApiStatGrouping::Day);
-    let week = pill("WEEK", state.api_stat_grouping == ApiStatGrouping::Week);
-    let month = pill("MONTH", state.api_stat_grouping == ApiStatGrouping::Month);
-    let vert = pill(
-        "VERT",
-        state.api_stat_orientation == ChartOrientation::Vertical,
-    );
-    let horz = pill(
-        "HORZ",
-        state.api_stat_orientation == ChartOrientation::Horizontal,
-    );
-    let classic = pill("CLASS", state.display_style == DisplayStyle::Classic);
-    let system_compact = pill("SCOMP", state.display_style == DisplayStyle::SystemCompact);
-    let system_full = pill("SFULL", state.display_style == DisplayStyle::SystemFull);
-
-    let mut segments = vec![
-        (" VIEW ", None),
-        (
-            " BARS ",
-            Some(UiClickAction::SetApiStatGraph(ApiStatGraph::Bars)),
-        ),
-        (
-            " HEAT ",
-            Some(UiClickAction::SetApiStatGraph(ApiStatGraph::Heat)),
-        ),
-        (" GRAPH ", None),
-        (
-            " DAY ",
-            Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Day)),
-        ),
-        (
-            " WEEK ",
-            Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Week)),
-        ),
-        (
-            " MONTH ",
-            Some(UiClickAction::SetApiStatGrouping(ApiStatGrouping::Month)),
-        ),
-    ];
-    let accent_color = state.accent_text_color();
-    let mut spans = vec![control_group_label("VIEW", accent_color), bars, heat];
-    spans.push(control_group_label("GRAPH", accent_color));
-    spans.extend([day, week, month]);
-    if state.api_stat_graph == ApiStatGraph::Bars {
-        segments.extend([
-            (" BARS ", None),
-            (
-                " VERT ",
-                Some(UiClickAction::SetApiStatOrientation(
-                    ChartOrientation::Vertical,
-                )),
-            ),
-            (
-                " HORZ ",
-                Some(UiClickAction::SetApiStatOrientation(
-                    ChartOrientation::Horizontal,
-                )),
-            ),
-        ]);
-        spans.push(control_group_label("BARS", accent_color));
-        spans.extend([vert, horz]);
-    }
-    segments.extend([
-        (" ZONE ", None),
-        (" UTC ", None),
-        (" STYLE ", None),
-        (
-            " CLASS ",
-            Some(UiClickAction::SetDisplayStyle(DisplayStyle::Classic)),
-        ),
-        (
-            " SCOMP ",
-            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemCompact)),
-        ),
-        (
-            " SFULL ",
-            Some(UiClickAction::SetDisplayStyle(DisplayStyle::SystemFull)),
-        ),
-    ]);
-    spans.push(control_group_label("ZONE", accent_color));
-    spans.push(pill("UTC", true));
-    spans.push(control_group_label("STYLE", accent_color));
-    spans.extend([classic, system_compact, system_full]);
-
-    register_right_aligned_targets(state, chunks[0], &segments);
-    frame.render_widget(
-        Paragraph::new(Line::from(spans)).alignment(Alignment::Right),
-        chunks[0],
-    );
-
-    if let Some(text) = reset_summary {
-        let _ = render_reset_summary(frame, chunks[1], text, state.accent_text_color(), None);
-    }
-}
-
-fn render_api_stat_message(frame: &mut Frame<'_>, area: Rect, message: &str) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .padding(Padding {
-            left: 2,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .title(Span::styled(" APISTAT ", Style::default().fg(Color::Gray)));
-    let text = Text::from(vec![
-        Line::from(message.to_string()),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Live limits require a Claude subscription limit source (planned: OAuth usage, status line).",
-            Style::default().fg(Color::Gray),
-        )),
-    ]);
-    frame.render_widget(
-        Paragraph::new(text).block(block).wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn api_stat_card_specs(
-    state: &AppState,
-    usage: &crate::limits::AccountUsage,
-    card_width: u16,
-) -> Vec<(&'static str, CardSpec)> {
-    let formatter = state.formatter();
-    let (limits_value, limits_captions) =
-        limits_card_content(state, uses_compact_limit_lines(card_width));
-    let summary = &usage.summary;
-
-    vec![
-        ("LIMITS", CardSpec::limits(limits_value, limits_captions)),
-        (
-            "LIFETIME",
-            CardSpec::new(
-                format_optional_account_tokens(summary.lifetime_tokens, formatter),
-                vec!["tokens".to_string(), "account-wide / UTC".to_string()],
-            ),
-        ),
-        (
-            "PEAK_DAY",
-            CardSpec::new(
-                format_optional_account_tokens(summary.peak_daily_tokens, formatter),
-                vec!["tokens".to_string(), "highest UTC day".to_string()],
-            ),
-        ),
-        (
-            "STREAK",
-            CardSpec::new(
-                format_optional_days(summary.current_streak_days, formatter),
-                vec!["current".to_string(), "UTC days".to_string()],
-            ),
-        ),
-        (
-            "BEST_STREAK",
-            CardSpec::new(
-                format_optional_days(summary.longest_streak_days, formatter),
-                vec!["longest".to_string(), "UTC days".to_string()],
-            ),
-        ),
-        (
-            "LONGEST_TURN",
-            CardSpec::new(
-                summary
-                    .longest_running_turn_sec
-                    .map(format_account_duration)
-                    .unwrap_or_else(|| "--".to_string()),
-                vec!["elapsed".to_string(), "server-recorded".to_string()],
-            ),
-        ),
-    ]
-}
-
-fn api_stat_cards_height(state: &AppState, usage: &crate::limits::AccountUsage, width: u16) -> u16 {
-    let layout = usage_card_layout(width);
-    let specs = api_stat_card_specs(state, usage, layout.min_card_width.max(1));
-    specs
-        .chunks(layout.columns)
-        .map(|row| api_stat_card_row_height(row, layout.min_card_width.max(1)))
-        .sum()
-}
-
-fn render_api_stat_cards(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &AppState,
-    usage: &crate::limits::AccountUsage,
-) -> Option<WeeklyPaceHover> {
-    let layout = usage_card_layout(area.width);
-    let card_width = layout.min_card_width.max(1);
-    let compact_limits = uses_compact_limit_lines(card_width);
-    let specs = api_stat_card_specs(state, usage, card_width);
-    let row_heights = specs
-        .chunks(layout.columns)
-        .map(|row| api_stat_card_row_height(row, card_width))
-        .collect::<Vec<_>>();
-
-    if layout.columns == 6 {
-        render_api_stat_card_row(frame, area, &specs, state, compact_limits)
-    } else {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(row_heights[0]),
-                Constraint::Length(row_heights[1]),
-            ])
-            .split(area);
-        let top = render_api_stat_card_row(frame, rows[0], &specs[..3], state, compact_limits);
-        let bottom = render_api_stat_card_row(frame, rows[1], &specs[3..], state, compact_limits);
-        top.or(bottom)
-    }
-}
-
-fn api_stat_card_row_height(cards: &[(&'static str, CardSpec)], card_width: u16) -> u16 {
-    cards
-        .iter()
-        .map(|(_, spec)| spec.required_height(card_width))
-        .max()
-        .unwrap_or(0)
-}
-
-fn render_api_stat_card_row(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    cards: &[(&'static str, CardSpec)],
-    state: &AppState,
-    compact_limits: bool,
-) -> Option<WeeklyPaceHover> {
-    if cards.is_empty() {
-        return None;
-    }
-    let constraints = match cards.len() {
-        6 => vec![
-            Constraint::Percentage(17),
-            Constraint::Percentage(17),
-            Constraint::Percentage(17),
-            Constraint::Percentage(17),
-            Constraint::Percentage(16),
-            Constraint::Percentage(16),
-        ],
-        3 => vec![
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ],
-        count => vec![Constraint::Ratio(1, count as u32); count],
-    };
-    let areas = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(area);
-
-    let mut hover = None;
-    for (index, (title, spec)) in cards.iter().enumerate() {
-        if *title == "LIMITS" {
-            if let Some(next) = render_limits_card(frame, areas[index], state, compact_limits) {
-                hover = Some(next);
-            }
-            continue;
-        }
-        let Some((value, captions)) = spec.lines.split_first() else {
-            continue;
-        };
-        let captions = captions
-            .iter()
-            .map(|caption| Some(caption.as_str()))
-            .collect::<Vec<_>>();
-        frame.render_widget(card_with_captions(title, value, &captions), areas[index]);
-    }
-    hover
-}
-
-fn format_optional_account_tokens(value: Option<u64>, formatter: DisplayFormatter<'_>) -> String {
-    let Some(value) = value else {
-        return "--".to_string();
-    };
-    match formatter.style() {
-        DisplayStyle::SystemCompact => format_compact_kmb(value, 16, formatter),
-        DisplayStyle::Classic | DisplayStyle::SystemFull => formatter.format_u64(value),
-    }
-}
-
-fn format_optional_days(value: Option<u64>, formatter: DisplayFormatter<'_>) -> String {
-    value
-        .map(|value| format!("{} days", formatter.format_u64(value)))
-        .unwrap_or_else(|| "--".to_string())
-}
-
-fn format_account_duration(mut seconds: u64) -> String {
-    let days = seconds / 86_400;
-    seconds %= 86_400;
-    let hours = seconds / 3_600;
-    seconds %= 3_600;
-    let minutes = seconds / 60;
-    seconds %= 60;
-
-    if days > 0 {
-        format!("{days}d {hours}h {minutes}m")
-    } else if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ApiStatPoint {
-    start: NaiveDate,
-    end: NaiveDate,
-    tokens: u64,
-    active_days: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChartScrollbarOwner {
     Usage,
-    ApiStat,
     Activity,
 }
 
@@ -959,10 +560,6 @@ fn render_chart_scrollbar(
             UiClickAction::ScrollUsageOlder,
             UiClickAction::ScrollUsageNewer,
         ),
-        ChartScrollbarOwner::ApiStat => (
-            UiClickAction::ScrollApiStatOlder,
-            UiClickAction::ScrollApiStatNewer,
-        ),
         ChartScrollbarOwner::Activity => (
             UiClickAction::ScrollActivityOlder,
             UiClickAction::ScrollActivityNewer,
@@ -1016,7 +613,6 @@ fn render_chart_scrollbar(
         let offset = max_offset.saturating_sub(logical_start);
         let action = match owner {
             ChartScrollbarOwner::Usage => UiClickAction::SetUsageScrollOffset(offset),
-            ChartScrollbarOwner::ApiStat => UiClickAction::SetApiStatScrollOffset(offset),
             ChartScrollbarOwner::Activity => UiClickAction::SetActivityScrollOffset(offset),
         };
         state.ui_hit_targets.push(UiHitTarget {
@@ -1064,19 +660,6 @@ fn viewport_label(
     )
 }
 
-fn horizontal_bar_height(total: usize, height: u16) -> u16 {
-    if total == 0 {
-        return 1;
-    }
-    if total <= usize::from(height / 3) {
-        3
-    } else if total <= usize::from(height / 2) {
-        2
-    } else {
-        1
-    }
-}
-
 fn usage_horizontal_bar_height(total: usize, height: u16) -> u16 {
     if total == 0 {
         return 1;
@@ -1093,20 +676,6 @@ fn usage_horizontal_bar_height(total: usize, height: u16) -> u16 {
     }
 }
 
-fn update_api_stat_viewport(
-    state: &mut AppState,
-    area: Rect,
-    total: usize,
-    visible_capacity: usize,
-) -> (usize, usize) {
-    let (start, end) = viewport_bounds(total, visible_capacity, state.api_stat_period_offset);
-    state.api_stat_period_offset = total.saturating_sub(end);
-    state.api_stat_total_periods = total;
-    state.api_stat_visible_periods = end.saturating_sub(start);
-    state.api_stat_scroll_area = Some(area);
-    (start, end)
-}
-
 fn update_usage_viewport(
     state: &mut AppState,
     area: Rect,
@@ -1121,850 +690,6 @@ fn update_usage_viewport(
     (start, end)
 }
 
-fn render_api_stat_chart(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    usage: &crate::limits::AccountUsage,
-    state: &mut AppState,
-) {
-    match state.api_stat_graph {
-        ApiStatGraph::Heat => render_api_stat_heatmap(frame, area, usage, state),
-        ApiStatGraph::Bars
-            if state.api_stat_grouping == ApiStatGrouping::Day
-                && state.api_stat_orientation == ChartOrientation::Vertical =>
-        {
-            render_api_daily_chart(frame, area, usage, state)
-        }
-        ApiStatGraph::Bars => {
-            let points = aggregate_api_stat_points(
-                usage.daily_usage_buckets.as_deref().unwrap_or(&[]),
-                state.api_stat_grouping,
-                crate::usage::system_first_weekday(),
-            );
-            render_api_grouped_bars(frame, area, &points, state);
-        }
-    }
-}
-
-fn aggregate_api_stat_points(
-    buckets: &[crate::limits::DailyUsageBucket],
-    grouping: ApiStatGrouping,
-    first_weekday: Weekday,
-) -> Vec<ApiStatPoint> {
-    let mut grouped = BTreeMap::<NaiveDate, (u64, usize)>::new();
-    for bucket in buckets {
-        let Ok(date) = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d") else {
-            continue;
-        };
-        let start = api_stat_period_start(date, grouping, first_weekday);
-        let entry = grouped.entry(start).or_default();
-        entry.0 = entry.0.saturating_add(bucket.tokens);
-        entry.1 = entry.1.saturating_add(1);
-    }
-    grouped
-        .into_iter()
-        .map(|(start, (tokens, active_days))| ApiStatPoint {
-            start,
-            end: api_stat_period_end(start, grouping),
-            tokens,
-            active_days,
-        })
-        .collect()
-}
-
-fn api_stat_period_start(
-    date: NaiveDate,
-    grouping: ApiStatGrouping,
-    _first_weekday: Weekday,
-) -> NaiveDate {
-    match grouping {
-        ApiStatGrouping::Day => date,
-        ApiStatGrouping::Week => {
-            date - ChronoDuration::days(date.weekday().num_days_from_monday() as i64)
-        }
-        ApiStatGrouping::Month => {
-            NaiveDate::from_ymd_opt(date.year(), date.month(), 1).unwrap_or(date)
-        }
-    }
-}
-
-fn api_stat_period_end(start: NaiveDate, grouping: ApiStatGrouping) -> NaiveDate {
-    match grouping {
-        ApiStatGrouping::Day => start,
-        ApiStatGrouping::Week => start + ChronoDuration::days(6),
-        ApiStatGrouping::Month => {
-            let (year, month) = if start.month() == 12 {
-                (start.year().saturating_add(1), 1)
-            } else {
-                (start.year(), start.month() + 1)
-            };
-            NaiveDate::from_ymd_opt(year, month, 1)
-                .map(|next| next - ChronoDuration::days(1))
-                .unwrap_or(start)
-        }
-    }
-}
-
-fn api_stat_grouping_label(grouping: ApiStatGrouping) -> &'static str {
-    match grouping {
-        ApiStatGrouping::Day => "DAY",
-        ApiStatGrouping::Week => "WEEK",
-        ApiStatGrouping::Month => "MONTH",
-    }
-}
-
-fn format_api_stat_point_label(
-    point: &ApiStatPoint,
-    grouping: ApiStatGrouping,
-    formatter: DisplayFormatter<'_>,
-) -> String {
-    match grouping {
-        ApiStatGrouping::Day => formatter.format_short_date(point.start),
-        ApiStatGrouping::Week => {
-            let range = if point.start.month() == point.end.month() {
-                format!(
-                    "{} {}-{}",
-                    formatter.abbreviated_month(point.start.month()),
-                    point.start.day(),
-                    point.end.day()
-                )
-            } else {
-                format!(
-                    "{} {}-{} {}",
-                    formatter.abbreviated_month(point.start.month()),
-                    point.start.day(),
-                    formatter.abbreviated_month(point.end.month()),
-                    point.end.day()
-                )
-            };
-            format!("W{:02} ({range})", point.start.iso_week().week())
-        }
-        ApiStatGrouping::Month => format!(
-            "{} {}",
-            formatter.abbreviated_month(point.start.month()),
-            point.start.year()
-        ),
-    }
-}
-
-fn format_api_stat_point_tooltip(
-    point: &ApiStatPoint,
-    grouping: ApiStatGrouping,
-    formatter: DisplayFormatter<'_>,
-) -> String {
-    let period = if grouping == ApiStatGrouping::Day {
-        formatter.format_full_date(point.start)
-    } else {
-        format!(
-            "{} - {}",
-            formatter.format_full_date(point.start),
-            formatter.format_full_date(point.end)
-        )
-    };
-    format!(
-        "{period} | {} tokens | {} active days",
-        formatter.format_u64(point.tokens),
-        formatter.format_usize(point.active_days)
-    )
-}
-
-fn render_api_grouped_bars(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    points: &[ApiStatPoint],
-    state: &mut AppState,
-) {
-    let grouping = state.api_stat_grouping;
-    let inner = inset_with_border_and_padding(
-        area,
-        Padding {
-            left: 1,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        },
-    );
-    let visible_capacity = match state.api_stat_orientation {
-        ChartOrientation::Vertical => vertical_bar_capacity(inner.width),
-        ChartOrientation::Horizontal => {
-            let bar_height = horizontal_bar_height(points.len(), inner.height);
-            usize::from((inner.height / bar_height).max(1))
-        }
-    };
-    let scrollbar_axis = match state.api_stat_orientation {
-        ChartOrientation::Vertical => ChartScrollbarAxis::Horizontal,
-        ChartOrientation::Horizontal => ChartScrollbarAxis::Vertical,
-    };
-    let (chart_inner, scrollbar_area) =
-        reserve_chart_scrollbar(inner, scrollbar_axis, points.len() > visible_capacity);
-    let (start, end) = update_api_stat_viewport(state, area, points.len(), visible_capacity);
-    let visible = &points[start..end];
-    let formatter = state.formatter();
-    let title = format!(" TOKEN_ACTIVITY_BY_{} ", api_stat_grouping_label(grouping));
-    let count = format!(
-        " {} PERIODS ",
-        viewport_label(points.len(), start, end, formatter)
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .padding(Padding {
-            left: 1,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .title(Span::styled(title, Style::default().fg(Color::Gray)))
-        .title_top(
-            Line::from(Span::styled(count, Style::default().fg(Color::Gray))).right_aligned(),
-        );
-    frame.render_widget(block, area);
-    if points.is_empty() {
-        frame.render_widget(
-            Paragraph::new("The account service returned no daily usage buckets.")
-                .style(Style::default().fg(Color::Gray)),
-            inner,
-        );
-        return;
-    }
-
-    match state.api_stat_orientation {
-        ChartOrientation::Vertical => {
-            render_api_grouped_vertical_bars(frame, chart_inner, visible, grouping, state)
-        }
-        ChartOrientation::Horizontal => {
-            render_api_grouped_horizontal_bars(frame, chart_inner, visible, grouping, state)
-        }
-    }
-    if let Some(scrollbar_area) = scrollbar_area {
-        render_chart_scrollbar(
-            frame,
-            scrollbar_area,
-            scrollbar_axis,
-            ChartScrollbarViewport {
-                total: points.len(),
-                visible: end.saturating_sub(start),
-                offset_from_newest: state.api_stat_period_offset,
-            },
-            ChartScrollbarOwner::ApiStat,
-            state,
-        );
-    }
-}
-
-fn render_api_grouped_vertical_bars(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    points: &[ApiStatPoint],
-    grouping: ApiStatGrouping,
-    state: &mut AppState,
-) {
-    if area.width < 3 || area.height < 3 {
-        return;
-    }
-    let (accent_color, accent_bright_color) = state.accent_colors();
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(2), Constraint::Length(1)])
-        .split(area);
-    let bars_area = chunks[0];
-    let labels_area = chunks[1];
-    let values = points.iter().map(|point| point.tokens).collect::<Vec<_>>();
-    let (bar_width, bar_gap) = compute_bar_layout(bars_area, points.len() as u16);
-    let bar_width = bar_width.max(1);
-    let max_value = values.iter().copied().max().unwrap_or(0).max(1);
-    let hovered = hovered_vertical_bar_index(
-        state.mouse_position,
-        bars_area,
-        bar_width,
-        bar_gap,
-        &values,
-        max_value,
-    );
-    let tooltip = hovered.and_then(|index| {
-        state.mouse_position.map(|mouse| {
-            (
-                mouse,
-                format_api_stat_point_tooltip(&points[index], grouping, state.formatter()),
-            )
-        })
-    });
-    let right = bars_area.x.saturating_add(bars_area.width);
-    let buf = frame.buffer_mut();
-    let mut last_label_end = labels_area.x;
-    for (index, point) in points.iter().enumerate() {
-        let x = bars_area
-            .x
-            .saturating_add((index as u16).saturating_mul(bar_width.saturating_add(bar_gap)));
-        if x >= right {
-            break;
-        }
-        let width = bar_width.min(right.saturating_sub(x));
-        let bar_fill = alternating_bar_fill(
-            index,
-            accent_color,
-            accent_bright_color,
-            state.bar_fill_mode,
-        );
-        let filled = ((bars_area.height as f64)
-            * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
-        .round() as u16;
-        let bottom = bars_area
-            .y
-            .saturating_add(bars_area.height)
-            .saturating_sub(1);
-        let top = bottom.saturating_sub(filled.saturating_sub(1));
-        for y in bars_area.y..bars_area.y.saturating_add(bars_area.height) {
-            for cell_x in x..x.saturating_add(width) {
-                if let Some(cell) = buf.cell_mut((cell_x, y)) {
-                    cell.set_char(' ');
-                    if filled > 0 && y >= top {
-                        cell.set_char(bar_fill.glyph)
-                            .set_style(bar_fill.cell_style.clone());
-                    }
-                }
-            }
-        }
-        if width >= 4 && filled >= 2 {
-            let value = format_compact_kmb(point.tokens, width, state.formatter());
-            let value = truncate_middle(&value, width as usize);
-            let value_x = x.saturating_add(width.saturating_sub(value.len() as u16) / 2);
-            let value_y = bottom.saturating_sub(1);
-            for (offset, ch) in value.chars().enumerate() {
-                if let Some(cell) = buf.cell_mut((value_x + offset as u16, value_y)) {
-                    cell.set_char(ch).set_style(bar_fill.value_style.clone());
-                }
-            }
-        }
-
-        let label = format_api_stat_point_label(point, grouping, state.formatter());
-        if x >= last_label_end {
-            let label = truncate_middle(&label, right.saturating_sub(x) as usize);
-            for (offset, ch) in label.chars().enumerate() {
-                if let Some(cell) = buf.cell_mut((x + offset as u16, labels_area.y)) {
-                    cell.set_char(ch)
-                        .set_style(Style::default().fg(Color::Gray));
-                }
-            }
-            last_label_end = x.saturating_add(label.len() as u16).saturating_add(1);
-        }
-    }
-    if let Some((mouse, text)) = tooltip {
-        render_chart_tooltip(frame, area, mouse, &text);
-    }
-}
-
-fn render_api_grouped_horizontal_bars(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    points: &[ApiStatPoint],
-    grouping: ApiStatGrouping,
-    state: &mut AppState,
-) {
-    if area.width < 18 || area.height == 0 {
-        return;
-    }
-    let (accent_color, accent_bright_color) = state.accent_colors();
-    let row_height = horizontal_bar_height(points.len(), area.height);
-    let max_value = points
-        .iter()
-        .map(|point| point.tokens)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let desired_label_width = points
-        .iter()
-        .map(|point| {
-            UnicodeWidthStr::width(
-                format_api_stat_point_label(point, grouping, state.formatter()).as_str(),
-            ) as u16
-        })
-        .max()
-        .unwrap_or(5)
-        .saturating_add(1);
-    let label_width = desired_label_width
-        .min(area.width.saturating_sub(14).max(6))
-        .max(6);
-    let value_width = 17_u16.min(area.width / 3).max(6);
-    let bar_width = area
-        .width
-        .saturating_sub(label_width)
-        .saturating_sub(value_width)
-        .saturating_sub(1)
-        .max(1);
-    let mut hovered = None;
-    let buf = frame.buffer_mut();
-    for (index, point) in points.iter().enumerate() {
-        let row_y = area
-            .y
-            .saturating_add((index as u16).saturating_mul(row_height));
-        if row_y >= area.y.saturating_add(area.height) {
-            break;
-        }
-        let mid_y = row_y.saturating_add(row_height / 2);
-        let label = truncate_middle(
-            &format_api_stat_point_label(point, grouping, state.formatter()),
-            label_width.saturating_sub(1) as usize,
-        );
-        write_text(
-            buf,
-            area.x,
-            mid_y,
-            label_width.saturating_sub(1),
-            &label,
-            Style::default().fg(Color::Gray),
-        );
-        let bar_x = area.x.saturating_add(label_width);
-        let filled = ((bar_width as f64) * (point.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
-            .round() as u16;
-        let bar_fill = alternating_bar_fill(
-            index,
-            accent_color,
-            accent_bright_color,
-            state.bar_fill_mode,
-        );
-        for y in row_y..row_y.saturating_add(row_height).min(area.y + area.height) {
-            for offset in 0..bar_width {
-                if let Some(cell) = buf.cell_mut((bar_x + offset, y)) {
-                    cell.set_char(' ');
-                    if offset < filled {
-                        cell.set_char(bar_fill.glyph)
-                            .set_style(bar_fill.cell_style.clone());
-                    }
-                }
-            }
-        }
-        let value = format_optional_account_tokens(Some(point.tokens), state.formatter());
-        let value = truncate_middle(&value, value_width.saturating_sub(1) as usize);
-        let value_x = area
-            .x
-            .saturating_add(area.width)
-            .saturating_sub(value.len() as u16);
-        write_text(
-            buf,
-            value_x,
-            mid_y,
-            value.len() as u16,
-            &value,
-            Style::default().fg(Color::Gray),
-        );
-
-        if let Some((mouse_x, mouse_y)) = state.mouse_position {
-            if mouse_y >= row_y
-                && mouse_y < row_y.saturating_add(row_height)
-                && mouse_x >= bar_x
-                && mouse_x < bar_x.saturating_add(filled)
-            {
-                hovered = Some((
-                    (mouse_x, mouse_y),
-                    format_api_stat_point_tooltip(point, grouping, state.formatter()),
-                ));
-            }
-        }
-    }
-    if let Some((mouse, text)) = hovered {
-        render_chart_tooltip(frame, area, mouse, &text);
-    }
-}
-
-fn render_api_stat_heatmap(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    usage: &crate::limits::AccountUsage,
-    state: &mut AppState,
-) {
-    let mut values = BTreeMap::<NaiveDate, u64>::new();
-    for bucket in usage.daily_usage_buckets.as_deref().unwrap_or(&[]) {
-        if let Ok(date) = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d") {
-            values
-                .entry(date)
-                .and_modify(|tokens| *tokens = tokens.saturating_add(bucket.tokens))
-                .or_insert(bucket.tokens);
-        }
-    }
-    let inner = inset_with_border_and_padding(
-        area,
-        Padding {
-            left: 1,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        },
-    );
-    let first_weekday = Weekday::Mon;
-    let first_date = *values.keys().next().unwrap_or(&Utc::now().date_naive());
-    let last_date = *values.keys().next_back().unwrap_or(&first_date);
-    let calendar_start = api_stat_period_start(first_date, ApiStatGrouping::Week, first_weekday);
-    let calendar_end = api_stat_period_end(
-        api_stat_period_start(last_date, ApiStatGrouping::Week, first_weekday),
-        ApiStatGrouping::Week,
-    );
-    let weeks_total = if values.is_empty() {
-        0
-    } else {
-        ((calendar_end - calendar_start).num_days() / 7 + 1).max(1) as usize
-    };
-    let grid_width = inner.width.saturating_sub(ACTIVITY_WEEKDAY_LABEL_WIDTH);
-    let cell_width = activity_day_cell_width(grid_width, weeks_total);
-    let weeks_capacity = usize::from(grid_width / cell_width.max(1)).max(1);
-    let (chart_inner, scrollbar_area) = reserve_chart_scrollbar(
-        inner,
-        ChartScrollbarAxis::Horizontal,
-        weeks_total > weeks_capacity,
-    );
-    let (week_start, week_end) = update_api_stat_viewport(state, area, weeks_total, weeks_capacity);
-    let formatter = state.formatter();
-    let title = " DAILY_TOKEN_HEATMAP ";
-    let count = if weeks_total == 0 {
-        " 0 ACTIVE DAYS ".to_string()
-    } else {
-        format!(
-            " {} ACTIVE DAYS | {} WEEKS ",
-            formatter.format_usize(values.len()),
-            viewport_label(weeks_total, week_start, week_end, formatter)
-        )
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .padding(Padding {
-            left: 1,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .title(Span::styled(title, Style::default().fg(Color::Gray)))
-        .title_top(
-            Line::from(Span::styled(count, Style::default().fg(Color::Gray))).right_aligned(),
-        );
-    frame.render_widget(block, area);
-    let inner = chart_inner;
-    if values.is_empty() {
-        frame.render_widget(
-            Paragraph::new("The account service returned no daily usage buckets.")
-                .style(Style::default().fg(Color::Gray)),
-            inner,
-        );
-        return;
-    }
-    if inner.width <= ACTIVITY_WEEKDAY_LABEL_WIDTH || inner.height < 8 {
-        render_activity_message(frame, inner, "Heatmap needs more space.");
-        return;
-    }
-
-    let weeks_visible = week_end.saturating_sub(week_start);
-    if weeks_visible == 0 {
-        return;
-    }
-    let visible_start = calendar_start + ChronoDuration::weeks(week_start as i64);
-    let grid_x = inner.x.saturating_add(ACTIVITY_WEEKDAY_LABEL_WIDTH);
-    let max_value = values.values().copied().max().unwrap_or(0);
-    let accent_color = state.accent_colors().0;
-    let buf = frame.buffer_mut();
-
-    let mut next_free_x = grid_x;
-    for week in 0..weeks_visible {
-        let week_start = visible_start + ChronoDuration::weeks(week as i64);
-        let label_date = if week == 0 {
-            Some(week_start)
-        } else {
-            (0..7)
-                .map(|day| week_start + ChronoDuration::days(day))
-                .find(|date| date.day() == 1)
-        };
-        let label = label_date.map(|date| formatter.abbreviated_month(date.month()));
-        if let Some(label) = label {
-            let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
-            if x >= next_free_x {
-                write_text(
-                    buf,
-                    x,
-                    inner.y,
-                    UnicodeWidthStr::width(label.as_str()) as u16,
-                    &label,
-                    Style::default().fg(Color::Gray),
-                );
-                next_free_x = x
-                    .saturating_add(UnicodeWidthStr::width(label.as_str()) as u16)
-                    .saturating_add(1);
-            }
-        }
-    }
-
-    for row in 0..7usize {
-        let y = inner.y.saturating_add(1 + row as u16);
-        write_text(
-            buf,
-            inner.x,
-            y,
-            ACTIVITY_WEEKDAY_LABEL_WIDTH,
-            &activity_weekday_label(first_weekday, row, formatter),
-            Style::default().fg(Color::Gray),
-        );
-        for week in 0..weeks_visible {
-            let date = visible_start
-                + ChronoDuration::weeks(week as i64)
-                + ChronoDuration::days(row as i64);
-            let tokens = values.get(&date).copied().unwrap_or(0);
-            let level = api_stat_color_level(tokens, max_value);
-            let x = grid_x.saturating_add((week as u16).saturating_mul(cell_width));
-            write_activity_cell(buf, x, y, cell_width, level, accent_color);
-        }
-    }
-
-    let tooltip = state.mouse_position.and_then(|mouse| {
-        if mouse.0 < grid_x
-            || mouse.0 >= grid_x.saturating_add((weeks_visible as u16) * cell_width)
-            || mouse.1 < inner.y.saturating_add(1)
-            || mouse.1 >= inner.y.saturating_add(8)
-        {
-            return None;
-        }
-        let week = usize::from((mouse.0 - grid_x) / cell_width);
-        let row = i64::from(mouse.1 - inner.y - 1);
-        let date = visible_start + ChronoDuration::weeks(week as i64) + ChronoDuration::days(row);
-        let tokens = values.get(&date).copied().unwrap_or(0);
-        Some((
-            mouse,
-            format!(
-                "{} | {} tokens",
-                formatter.format_full_date(date),
-                formatter.format_u64(tokens)
-            ),
-        ))
-    });
-    if let Some((mouse, text)) = tooltip {
-        render_chart_tooltip(frame, inner, mouse, &text);
-    }
-    if let Some(scrollbar_area) = scrollbar_area {
-        render_chart_scrollbar(
-            frame,
-            scrollbar_area,
-            ChartScrollbarAxis::Horizontal,
-            ChartScrollbarViewport {
-                total: weeks_total,
-                visible: week_end.saturating_sub(week_start),
-                offset_from_newest: state.api_stat_period_offset,
-            },
-            ChartScrollbarOwner::ApiStat,
-            state,
-        );
-    }
-}
-
-fn api_stat_color_level(value: u64, max_value: u64) -> usize {
-    if value == 0 || max_value == 0 {
-        return 0;
-    }
-    let level = ((value as f64 / max_value as f64) * ACTIVITY_COLOR_LEVELS as f64).ceil() as usize;
-    level.clamp(1, ACTIVITY_COLOR_LEVELS)
-}
-
-fn render_api_daily_chart(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    usage: &crate::limits::AccountUsage,
-    state: &mut AppState,
-) {
-    let buckets = usage.daily_usage_buckets.as_deref().unwrap_or(&[]);
-    let inner = inset_with_border_and_padding(
-        area,
-        Padding {
-            left: 1,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        },
-    );
-    let visible_capacity = vertical_bar_capacity(inner.width);
-    let (chart_inner, scrollbar_area) = reserve_chart_scrollbar(
-        inner,
-        ChartScrollbarAxis::Horizontal,
-        buckets.len() > visible_capacity,
-    );
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(2), Constraint::Length(1)])
-        .split(chart_inner);
-    let bars_area = chunks[0];
-    let labels_area = chunks[1];
-    let (visible_start, visible_end) =
-        update_api_stat_viewport(state, area, buckets.len(), visible_capacity);
-    let visible = &buckets[visible_start..visible_end];
-    let formatter = state.formatter();
-    let (accent_color, accent_bright_color) = state.accent_colors();
-    let count_label = if buckets.is_empty() {
-        " NO DAILY DATA ".to_string()
-    } else {
-        let range = visible
-            .first()
-            .zip(visible.last())
-            .map(|(first, last)| {
-                let first = NaiveDate::parse_from_str(&first.start_date, "%Y-%m-%d")
-                    .map(|date| formatter.format_full_date(date))
-                    .unwrap_or_else(|_| first.start_date.clone());
-                let last = NaiveDate::parse_from_str(&last.start_date, "%Y-%m-%d")
-                    .map(|date| formatter.format_full_date(date))
-                    .unwrap_or_else(|_| last.start_date.clone());
-                format!(" {first} - {last} ")
-            })
-            .unwrap_or_default();
-        format!(
-            " {} ACTIVE DAYS{range}",
-            viewport_label(buckets.len(), visible_start, visible_end, formatter)
-        )
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .padding(Padding {
-            left: 1,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .title(Span::styled(
-            " DAILY_TOKEN_ACTIVITY ",
-            Style::default().fg(Color::Gray),
-        ))
-        .title_top(
-            Line::from(Span::styled(count_label, Style::default().fg(Color::Gray))).right_aligned(),
-        );
-    frame.render_widget(block.clone(), area);
-
-    if buckets.is_empty() || chart_inner.width < 3 || chart_inner.height < 3 {
-        if buckets.is_empty() {
-            frame.render_widget(
-                Paragraph::new("The account service returned no daily usage buckets.")
-                    .style(Style::default().fg(Color::Gray)),
-                chart_inner,
-            );
-        }
-        return;
-    }
-
-    let values = visible
-        .iter()
-        .map(|bucket| bucket.tokens)
-        .collect::<Vec<_>>();
-    let (bar_width, bar_gap) = compute_bar_layout(bars_area, visible.len() as u16);
-    let bar_width = bar_width.max(1);
-    let max_value = values.iter().copied().max().unwrap_or(0).max(1);
-    let hovered = hovered_vertical_bar_index(
-        state.mouse_position,
-        bars_area,
-        bar_width,
-        bar_gap,
-        &values,
-        max_value,
-    );
-    let tooltip = hovered.and_then(|index| {
-        state.mouse_position.map(|mouse| {
-            (
-                mouse,
-                format_vertical_bar_tooltip(
-                    &visible[index].start_date,
-                    visible[index].tokens,
-                    UsageMetric::Tokens,
-                    formatter,
-                ),
-            )
-        })
-    });
-
-    let buf = frame.buffer_mut();
-    let mut previous_month = None;
-    let mut last_label_end = labels_area.x;
-    for (index, bucket) in visible.iter().enumerate() {
-        let x = bars_area
-            .x
-            .saturating_add((index as u16).saturating_mul(bar_width.saturating_add(bar_gap)));
-        let right = bars_area.x.saturating_add(bars_area.width);
-        if x >= right {
-            break;
-        }
-        let width = bar_width.min(right.saturating_sub(x));
-        let bar_fill = alternating_bar_fill(
-            index,
-            accent_color,
-            accent_bright_color,
-            state.bar_fill_mode,
-        );
-        let filled_height = ((bars_area.height as f64)
-            * (bucket.tokens as f64 / max_value as f64).clamp(0.0, 1.0))
-        .round() as u16;
-        let bottom = bars_area
-            .y
-            .saturating_add(bars_area.height)
-            .saturating_sub(1);
-        let top = bottom.saturating_sub(filled_height.saturating_sub(1));
-        for y in bars_area.y..bars_area.y.saturating_add(bars_area.height) {
-            for cell_x in x..x.saturating_add(width) {
-                if let Some(cell) = buf.cell_mut((cell_x, y)) {
-                    cell.set_char(' ');
-                    if filled_height > 0 && y >= top {
-                        cell.set_char(bar_fill.glyph)
-                            .set_style(bar_fill.cell_style.clone());
-                    }
-                }
-            }
-        }
-
-        if width >= 4 && filled_height >= 2 {
-            let value = format_compact_kmb(bucket.tokens, width, formatter);
-            let value = truncate_middle(&value, width as usize);
-            let value_x = x.saturating_add(width.saturating_sub(value.len() as u16) / 2);
-            let value_y = bottom.saturating_sub(1);
-            for (offset, ch) in value.chars().enumerate() {
-                if let Some(cell) = buf.cell_mut((value_x + offset as u16, value_y)) {
-                    cell.set_char(ch).set_style(bar_fill.value_style.clone());
-                }
-            }
-        }
-
-        let parsed = NaiveDate::parse_from_str(&bucket.start_date, "%Y-%m-%d").ok();
-        let month_key = parsed.map(|date| (date.year(), date.month()));
-        let label = if width >= 5 {
-            parsed.map(|date| formatter.format_short_date(date))
-        } else if month_key != previous_month {
-            parsed.map(|date| formatter.abbreviated_month(date.month()))
-        } else {
-            None
-        };
-        previous_month = month_key;
-        if let Some(label) = label {
-            if x >= last_label_end {
-                let label = truncate_middle(&label, right.saturating_sub(x) as usize);
-                for (offset, ch) in label.chars().enumerate() {
-                    if let Some(cell) = buf.cell_mut((x + offset as u16, labels_area.y)) {
-                        cell.set_char(ch)
-                            .set_style(Style::default().fg(Color::Gray));
-                    }
-                }
-                last_label_end = x.saturating_add(label.len() as u16).saturating_add(1);
-            }
-        }
-    }
-
-    if let Some((mouse, text)) = tooltip {
-        render_chart_tooltip(frame, chart_inner, mouse, &text);
-    }
-    if let Some(scrollbar_area) = scrollbar_area {
-        render_chart_scrollbar(
-            frame,
-            scrollbar_area,
-            ChartScrollbarAxis::Horizontal,
-            ChartScrollbarViewport {
-                total: buckets.len(),
-                visible: visible_end.saturating_sub(visible_start),
-                offset_from_newest: state.api_stat_period_offset,
-            },
-            ChartScrollbarOwner::ApiStat,
-            state,
-        );
-    }
-}
-
 fn footer_hint(screen: ActiveScreen) -> &'static str {
     match screen {
         ActiveScreen::Usage => {
@@ -1974,10 +699,7 @@ fn footer_hint(screen: ActiveScreen) -> &'static str {
             "Activity: Statistic [tab] (tokens/time/runs), Projects [+/-], Scroll [wheel/left/right/PgUp/PgDn/Home/End], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::ApiStat => {
-            "Server stats: View [b] (bars/heat), Group [g] (day/week/month), Layout [f] (vertical/horizontal), Zone: UTC (server), Scroll [wheel/arrows/PgUp/PgDn/Home/End], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
-        }
-        ActiveScreen::LimitResets => {
-            "Limit resets: Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+            "APISTAT: View [v/tab] (limits/models), Dates [d] (all/7d/30d), Copy models [ctrl+s], Refresh limits [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::Read => "",
     }
@@ -1988,11 +710,9 @@ fn footer_error(state: &AppState) -> String {
         ActiveScreen::Usage => state
             .usage_error
             .as_deref()
-            .or(state.limits_error.as_deref())
-            .or(state.limit_reset_error.as_deref()),
+            .or(state.limits_error.as_deref()),
         ActiveScreen::Activity => state.usage_error.as_deref(),
-        ActiveScreen::ApiStat => state.account_usage_error.as_deref(),
-        ActiveScreen::LimitResets => state.limits_error.as_deref(),
+        ActiveScreen::ApiStat => state.limits_error.as_deref(),
         ActiveScreen::Read => None,
     }
     .unwrap_or("");
@@ -2037,28 +757,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
 
 fn render_usage(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let cards_height = usage_cards_height(state, area.width);
-    let reset_summary = reset_summary_text(state);
-    let reset_button = reset_summary
-        .as_ref()
-        .map(|_| limit_reset_button_view(state));
-    let controls_height = usage_controls_height(
-        reset_summary.as_deref(),
-        area.width,
-        reset_button.as_ref().map(LimitResetButtonView::width),
-    );
-    let chunks = usage_layout(area, controls_height, cards_height);
+    let chunks = usage_layout(area, 1, cards_height);
 
-    let reset_hover = render_usage_controls(
-        frame,
-        chunks[0],
-        state,
-        reset_summary.as_deref(),
-        reset_button.as_ref(),
-    );
+    render_usage_controls(frame, chunks[0], state);
     let weekly_hover = render_usage_cards(frame, chunks[1], state);
     render_usage_chart(frame, chunks[2], state);
     render_top_models(frame, chunks[3], state);
-    if let Some(hover) = reset_hover.or(weekly_hover) {
+    if let Some(hover) = weekly_hover {
         render_weekly_pace_tooltip(frame, area, hover.mouse, &hover.text);
     }
 }
@@ -2082,18 +787,16 @@ fn usage_layout(area: Rect, controls_height: u16, cards_height: u16) -> [Rect; 4
 
 fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let cards_height = usage_cards_height(state, area.width);
-    let reset_summary = reset_summary_text(state);
-    let controls_height = activity_controls_height(reset_summary.as_deref(), area.width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(controls_height),
+            Constraint::Length(1),
             Constraint::Length(cards_height),
             Constraint::Min(1),
         ])
         .split(area);
 
-    render_activity_controls(frame, chunks[0], state, reset_summary.as_deref());
+    render_activity_controls(frame, chunks[0], state);
     let weekly_hover = render_usage_cards(frame, chunks[1], state);
     render_activity_heatmaps(frame, chunks[2], state);
     if let Some(hover) = weekly_hover {
@@ -2101,18 +804,7 @@ fn render_activity(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     }
 }
 
-fn render_activity_controls(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &mut AppState,
-    reset_summary: Option<&str>,
-) {
-    let reset_height = reset_summary_height(reset_summary, area.width, None);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
-        .split(area);
-
+fn render_activity_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let workspace_label = state
         .workspace_path
         .as_ref()
@@ -2126,16 +818,12 @@ fn render_activity_controls(
 
     render_flat_activity_controls(
         frame,
-        chunks[0],
+        area,
         state,
         &workspace_label,
         vec![tokens, time, runs],
         project_count,
     );
-
-    if let Some(text) = reset_summary {
-        let _ = render_reset_summary(frame, chunks[1], text, state.accent_text_color(), None);
-    }
 }
 
 fn render_flat_activity_controls(
@@ -2679,23 +1367,7 @@ fn write_text(
     }
 }
 
-fn render_usage_controls(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &mut AppState,
-    reset_summary: Option<&str>,
-    reset_button: Option<&LimitResetButtonView>,
-) -> Option<WeeklyPaceHover> {
-    let reset_height = reset_summary_height(
-        reset_summary,
-        area.width,
-        reset_button.map(LimitResetButtonView::width),
-    );
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(reset_height)])
-        .split(area);
-
+fn render_usage_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
     let workspace_label = state
         .workspace_path
         .as_ref()
@@ -2718,7 +1390,7 @@ fn render_usage_controls(
 
     render_flat_usage_controls(
         frame,
-        chunks[0],
+        area,
         state,
         &workspace_label,
         vec![
@@ -2737,29 +1409,6 @@ fn render_usage_controls(
             system_full,
         ],
     );
-
-    let button_area = reset_summary.and_then(|text| {
-        render_reset_summary(
-            frame,
-            chunks[1],
-            text,
-            state.accent_text_color(),
-            reset_button,
-        )
-    });
-    let button = reset_button?;
-    let button_area = button_area?;
-    if button.clickable {
-        state.ui_hit_targets.push(UiHitTarget {
-            area: button_area,
-            action: UiClickAction::PromptLimitReset,
-        });
-    }
-    let mouse = state.mouse_position?;
-    rect_contains(button_area, mouse).then(|| WeeklyPaceHover {
-        mouse,
-        text: button.tooltip.clone(),
-    })
 }
 
 fn render_workspace_label(frame: &mut Frame<'_>, area: Rect, workspace_label: &str) {
@@ -5202,25 +3851,13 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
         ]),
         ActiveScreen::ApiStat => Text::from(vec![
             Line::from("Keys:"),
-            Line::from("  g    - group bars by day/week/month"),
-            Line::from("  b    - toggle bars/heatmap"),
-            Line::from("  f    - toggle vertical/horizontal bars"),
-            Line::from("  Zone - UTC from the server"),
-            Line::from("  Wheel/arrows/PgUp/PgDn/Home/End - scroll periods"),
-            Line::from("  r/F5 - refresh server account statistics"),
+            Line::from("  v/Tab - switch LIMITS / MODELS view"),
+            Line::from("  d    - cycle Models dates (all / 7 days / 30 days)"),
+            Line::from("  ctrl+s - copy the Models table (terminal clipboard)"),
+            Line::from("  r/F5 - refresh live limits"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  c    - cycle color theme; click # to toggle chart fill"),
-            Line::from("  Mouse - click tabs; hover a daily bar for its exact value"),
-            Line::from("  s/F2 - switch screen"),
-            Line::from("  ?    - toggle help"),
-            Line::from("  q    - quit (confirm)"),
-        ]),
-        ActiveScreen::LimitResets => Text::from(vec![
-            Line::from("Keys:"),
-            Line::from("  r/F5 - refresh reset credits"),
-            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
-            Line::from("  c    - cycle color theme; click # to toggle chart fill"),
-            Line::from("  Mouse - click tabs/quit"),
+            Line::from("  Mouse - click tabs, views, and date ranges"),
             Line::from("  s/F2 - switch screen"),
             Line::from("  ?    - toggle help"),
             Line::from("  q    - quit (confirm)"),
@@ -5388,73 +4025,6 @@ fn render_history_catalog_scan_confirmation(
             pill("YES", false),
             Span::raw("   "),
             pill("NO", true),
-        ]))
-        .alignment(Alignment::Center),
-        buttons_area,
-    );
-}
-
-fn render_limit_reset_confirmation(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
-    state.ui_hit_targets.clear();
-
-    let popup = centered_rect(area.width.min(58), area.height.min(11), area);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
-            .title(Span::styled(
-                " Use reset credit ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )),
-        popup,
-    );
-
-    let message_area = Rect::new(
-        popup.x.saturating_add(2),
-        popup.y.saturating_add(2),
-        popup.width.saturating_sub(4),
-        popup.height.saturating_sub(5),
-    );
-    frame.render_widget(
-        Paragraph::new(Text::from(vec![
-            Line::from("Consume one reset credit and reset exhausted limits?"),
-            Line::from(""),
-            Line::from(Span::styled(
-                "The RESET button will be locked for one hour.",
-                Style::default().fg(Color::Gray),
-            )),
-            Line::from(Span::styled(
-                "Y confirms; N/Esc cancels.",
-                Style::default().fg(Color::Gray),
-            )),
-        ]))
-        .alignment(Alignment::Center)
-        .wrap(Wrap { trim: true }),
-        message_area,
-    );
-
-    let buttons_area = Rect::new(
-        popup.x.saturating_add(1),
-        popup.y.saturating_add(popup.height.saturating_sub(2)),
-        popup.width.saturating_sub(2),
-        1,
-    );
-    let segments = [
-        (" YES ", Some(UiClickAction::ConfirmLimitReset)),
-        ("   ", None),
-        (" NO ", Some(UiClickAction::CancelLimitReset)),
-    ];
-    state
-        .ui_hit_targets
-        .extend(centered_targets(buttons_area, &segments));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            pill("YES", state.limit_reset_confirm_yes_selected),
-            Span::raw("   "),
-            pill("NO", !state.limit_reset_confirm_yes_selected),
         ]))
         .alignment(Alignment::Center),
         buttons_area,
@@ -5844,356 +4414,6 @@ fn wrapped_line_count(text: &str, width: u16) -> u16 {
     total.max(1)
 }
 
-fn reset_credit_expiration_label(
-    expires_at: i64,
-    formatter: DisplayFormatter<'_>,
-) -> Option<String> {
-    let ms = crate::limits::normalize_epoch_millis(expires_at);
-    let dt = Local.timestamp_millis_opt(ms).single()?;
-    Some(formatter.format_reset_datetime(dt.naive_local()))
-}
-
-fn reset_summary_text(state: &AppState) -> Option<String> {
-    reset_summary_for_limits(state.limits.as_ref()?, state.formatter())
-}
-
-fn reset_summary_for_limits(
-    limits: &crate::limits::AccountRateLimits,
-    formatter: DisplayFormatter<'_>,
-) -> Option<String> {
-    let available = limits.reset_credits_available?;
-    let mut text = format!("Resets: {} available", formatter.format_count(available));
-    let earliest_expiry = limits
-        .reset_credits
-        .as_deref()
-        .and_then(|credits| credits.iter().filter_map(|credit| credit.expires_at).min());
-    if let Some(expiry) =
-        earliest_expiry.and_then(|expires_at| reset_credit_expiration_label(expires_at, formatter))
-    {
-        text.push_str(" | earliest expires ");
-        text.push_str(&expiry);
-    }
-    Some(text)
-}
-
-fn reset_summary_display_text(text: &str) -> String {
-    format!("LIMIT RESETS  {text}")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ResetSummaryLayout {
-    summary_area: Rect,
-    button_area: Option<Rect>,
-    height: u16,
-}
-
-fn reset_summary_layout(area: Rect, text: &str, button_width: Option<u16>) -> ResetSummaryLayout {
-    if area.width == 0 || area.height == 0 {
-        return ResetSummaryLayout {
-            summary_area: Rect::new(area.x, area.y, 0, 0),
-            button_area: None,
-            height: 0,
-        };
-    }
-
-    let display_text = reset_summary_display_text(text);
-    let display_width =
-        u16::try_from(UnicodeWidthStr::width(display_text.as_str())).unwrap_or(u16::MAX);
-    let wrapped_height = wrapped_line_count(&display_text, area.width);
-    let button_width = button_width.filter(|width| *width > 0);
-    let button_fits_same_line = button_width.is_some_and(|width| {
-        wrapped_height == 1 && display_width.saturating_add(width) <= area.width
-    });
-
-    if button_fits_same_line {
-        let width = button_width.unwrap_or_default();
-        return ResetSummaryLayout {
-            summary_area: Rect::new(area.x, area.y, display_width, 1),
-            button_area: Some(Rect::new(
-                area.x.saturating_add(display_width),
-                area.y,
-                width,
-                1,
-            )),
-            height: 2,
-        };
-    }
-
-    let button_area = button_width
-        .filter(|_| wrapped_height < area.height)
-        .map(|width| {
-            Rect::new(
-                area.x,
-                area.y.saturating_add(wrapped_height),
-                width.min(area.width),
-                1,
-            )
-        });
-    ResetSummaryLayout {
-        summary_area: Rect::new(area.x, area.y, area.width, wrapped_height.min(area.height)),
-        button_area,
-        height: wrapped_height
-            .saturating_add(u16::from(button_area.is_some()))
-            .saturating_add(1),
-    }
-}
-
-fn reset_summary_height(summary: Option<&str>, width: u16, button_width: Option<u16>) -> u16 {
-    summary
-        .map(|text| {
-            reset_summary_layout(Rect::new(0, 0, width, u16::MAX), text, button_width).height
-        })
-        .unwrap_or(0)
-}
-
-fn usage_controls_height(summary: Option<&str>, width: u16, button_width: Option<u16>) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width, button_width))
-}
-
-fn activity_controls_height(summary: Option<&str>, width: u16) -> u16 {
-    1_u16.saturating_add(reset_summary_height(summary, width, None))
-}
-
-#[derive(Debug, Clone)]
-struct LimitResetButtonView {
-    label: String,
-    style: Style,
-    tooltip: String,
-    clickable: bool,
-}
-
-impl LimitResetButtonView {
-    fn width(&self) -> u16 {
-        u16::try_from(UnicodeWidthStr::width(self.label.as_str())).unwrap_or(u16::MAX)
-    }
-}
-
-fn limit_reset_button_view(state: &AppState) -> LimitResetButtonView {
-    match state.limit_reset_button_state() {
-        LimitResetButtonState::Enabled => LimitResetButtonView {
-            label: " RESET ".to_string(),
-            style: Style::default()
-                .fg(Color::Black)
-                .bg(Color::White)
-                .add_modifier(Modifier::BOLD),
-            tooltip: "Use one reset credit for exhausted limit windows.".to_string(),
-            clickable: true,
-        },
-        LimitResetButtonState::Disabled => LimitResetButtonView {
-            label: " RESET ".to_string(),
-            style: Style::default().fg(Color::DarkGray),
-            tooltip: state.limit_reset_disabled_reason().to_string(),
-            clickable: false,
-        },
-        LimitResetButtonState::Cooldown(remaining_secs) => {
-            let minutes = remaining_secs.div_ceil(60);
-            let time = if minutes >= 60 {
-                "1h".to_string()
-            } else {
-                format!("{minutes}m")
-            };
-            LimitResetButtonView {
-                label: format!(" RESET {time} "),
-                style: Style::default().fg(Color::Gray),
-                tooltip: state
-                    .limit_reset_error
-                    .as_deref()
-                    .or(state.limit_reset_notice.as_deref())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("Reset cooldown active for about {time}.")),
-                clickable: false,
-            }
-        }
-        LimitResetButtonState::InFlight => LimitResetButtonView {
-            label: " RESET... ".to_string(),
-            style: Style::default()
-                .fg(state.accent_text_color())
-                .add_modifier(Modifier::BOLD),
-            tooltip: state
-                .limit_reset_error
-                .as_deref()
-                .or(state.limit_reset_notice.as_deref())
-                .unwrap_or("Reset request is in progress.")
-                .to_string(),
-            clickable: false,
-        },
-    }
-}
-
-fn reset_summary_line(text: &str, accent_color: Color) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(" LIMIT RESETS ", Style::default().fg(Color::White)),
-        Span::styled(text.to_string(), Style::default().fg(accent_color)),
-    ])
-}
-
-fn render_reset_summary(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    text: &str,
-    accent_color: Color,
-    button: Option<&LimitResetButtonView>,
-) -> Option<Rect> {
-    let layout = reset_summary_layout(area, text, button.map(LimitResetButtonView::width));
-    frame.render_widget(
-        Paragraph::new(reset_summary_line(text, accent_color)).wrap(Wrap { trim: true }),
-        layout.summary_area,
-    );
-    if let (Some(button), Some(button_area)) = (button, layout.button_area) {
-        frame.render_widget(Clear, button_area);
-        frame.render_widget(
-            Paragraph::new(Span::styled(button.label.clone(), button.style)),
-            button_area,
-        );
-    }
-    layout.button_area
-}
-
-fn render_limit_resets(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let summary = reset_summary_text(state);
-    let summary_height = reset_summary_height(summary.as_deref(), area.width, None);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(summary_height), Constraint::Min(0)])
-        .split(area);
-
-    if let Some(text) = summary.as_deref() {
-        let _ = render_reset_summary(frame, chunks[0], text, state.accent_text_color(), None);
-    }
-    render_limit_reset_details(frame, chunks[1], state);
-}
-
-fn reset_credit_date_time_label(timestamp: i64, formatter: DisplayFormatter<'_>) -> Option<String> {
-    let ms = crate::limits::normalize_epoch_millis(timestamp);
-    let dt = Local.timestamp_millis_opt(ms).single()?;
-    if dt.date_naive() == Local::now().date_naive() {
-        Some(format!("today {}", formatter.format_time(dt.naive_local())))
-    } else {
-        Some(formatter.format_reset_datetime(dt.naive_local()))
-    }
-}
-
-fn render_limit_reset_details(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .padding(Padding {
-            left: 2,
-            right: 1,
-            top: 1,
-            bottom: 0,
-        })
-        .title(Span::styled(
-            " Available reset credits ",
-            Style::default().fg(Color::Gray),
-        ));
-
-    let text = if !state.limits_enabled {
-        let message = state
-            .limits_error
-            .as_deref()
-            .or(state.limits_notice.as_deref())
-            .unwrap_or("Limits unavailable.");
-        Text::from(Line::from(Span::styled(
-            message.to_string(),
-            Style::default().fg(Color::Gray),
-        )))
-    } else {
-        match state.limits.as_ref() {
-            None => Text::from(Line::from(Span::styled(
-                "Loading reset credits...",
-                Style::default().fg(Color::Gray),
-            ))),
-            Some(limits) => match limits.reset_credits.as_deref() {
-                None => Text::from(vec![
-                    Line::from(
-                        "The server returned the reset-credit count but no individual details.",
-                    ),
-                    Line::from(Span::styled(
-                        "Refresh later to check whether expiration dates become available.",
-                        Style::default().fg(Color::Gray),
-                    )),
-                ]),
-                Some([]) => Text::from(Line::from(Span::styled(
-                    "No reset credits are currently available.",
-                    Style::default().fg(Color::Gray),
-                ))),
-                Some(credits) => {
-                    reset_credit_details_text(credits, state.formatter(), state.accent_text_color())
-                }
-            },
-        }
-    };
-
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(block)
-            .alignment(Alignment::Left)
-            .wrap(Wrap { trim: true }),
-        area,
-    );
-}
-
-fn reset_credit_details_text(
-    credits: &[crate::limits::RateLimitResetCredit],
-    formatter: DisplayFormatter<'_>,
-    accent_color: Color,
-) -> Text<'static> {
-    let mut lines = Vec::with_capacity(credits.len().saturating_mul(4));
-    for (index, credit) in credits.iter().enumerate() {
-        if index > 0 {
-            lines.push(Line::from(""));
-        }
-        let title = credit
-            .title
-            .as_deref()
-            .filter(|title| !title.trim().is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("Reset credit {}", index + 1));
-        lines.push(Line::from(Span::styled(
-            title,
-            Style::default().add_modifier(Modifier::BOLD),
-        )));
-
-        let status = credit.status.as_deref().unwrap_or("Unknown");
-        let expires = credit
-            .expires_at
-            .and_then(|timestamp| reset_credit_date_time_label(timestamp, formatter))
-            .map(|value| format!("expires {value}"))
-            .unwrap_or_else(|| "expiration unavailable".to_string());
-        let granted = credit
-            .granted_at
-            .and_then(|timestamp| reset_credit_date_time_label(timestamp, formatter))
-            .map(|value| format!("granted {value}"));
-        let reset_type = credit.reset_type.as_deref();
-        let mut metadata = format!("{status} | {expires}");
-        if let Some(granted) = granted {
-            metadata.push_str(" | ");
-            metadata.push_str(&granted);
-        }
-        if let Some(reset_type) = reset_type {
-            metadata.push_str(" | ");
-            metadata.push_str(reset_type);
-        }
-        lines.push(Line::from(Span::styled(
-            metadata,
-            Style::default().fg(accent_color),
-        )));
-
-        if let Some(description) = credit
-            .description
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            lines.push(Line::from(Span::styled(
-                description.to_string(),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-    }
-    Text::from(lines)
-}
-
 fn format_window_label(window_duration_mins: f64) -> Option<String> {
     if !window_duration_mins.is_finite() {
         return None;
@@ -6314,29 +4534,9 @@ fn format_limits_compact_card_lines(
     let (short_window, weekly_window) = rolling_windows_for_limits(l);
     let (rolling_first, rolling_second) =
         format_rolling_limit_lines(short_window, weekly_window, compact, formatter);
-    if let Some((monthly, used)) = format_individual_limit_compact_lines(l, compact, formatter) {
-        return (
-            monthly,
-            Some(used),
-            Some(rolling_first),
-            Some(rolling_second),
-        );
-    }
-
-    if let Some(extra) = format_extra_bucket_compact_line(l, compact, formatter) {
-        let credits =
-            format_credits_compact_line(l, formatter).unwrap_or_else(|| "Credits:  --".to_string());
-        (
-            rolling_first,
-            Some(rolling_second),
-            Some(extra),
-            Some(credits),
-        )
-    } else {
-        let credits =
-            format_credits_compact_line(l, formatter).unwrap_or_else(|| "Credits:  --".to_string());
-        (rolling_first, Some(rolling_second), Some(credits), None)
-    }
+    let extra = format_extra_bucket_compact_line(l, compact, formatter)
+        .or_else(|| format_extra_usage_compact_line(l, formatter));
+    (rolling_first, Some(rolling_second), extra, None)
 }
 
 const WEEKLY_WINDOW_MINUTES: f64 = 6.0 * 24.0 * 60.0;
@@ -6380,8 +4580,8 @@ fn rolling_windows_for_limits(
     }
     l.buckets
         .iter()
-        .find(|bucket| bucket.primary.is_some() || bucket.secondary.is_some())
-        .map(|bucket| classify_rolling_windows(bucket.primary.as_ref(), bucket.secondary.as_ref()))
+        .find(|bucket| bucket.primary.is_some())
+        .map(|bucket| classify_rolling_windows(bucket.primary.as_ref(), None))
         .unwrap_or((None, None))
 }
 
@@ -6713,13 +4913,6 @@ fn limit_usage_gauge(
             fair_percent: weekly_elapsed_allowed_percent(window, now_unix_secs),
         };
     }
-    if let Some(monthly) = limits.individual_limit.as_ref() {
-        let used_percent = monthly
-            .remaining_percent
-            .filter(|value| value.is_finite())
-            .map(|remaining| 100.0 - remaining);
-        return LimitUsageGauge::Monthly { used_percent };
-    }
 
     let (short_window, weekly_window) = rolling_windows_for_limits(limits);
     let usable_weekly_window =
@@ -6733,12 +4926,10 @@ fn limit_usage_gauge(
     let has_usable_short_window = short_window
         .is_some_and(|window| window.used_percent.is_some_and(|value| value.is_finite()));
     if !has_usable_short_window {
-        if let Some(monthly) = individual_limit_for_limits(limits) {
-            let used_percent = monthly
-                .remaining_percent
-                .filter(|value| value.is_finite())
-                .map(|remaining| 100.0 - remaining);
-            return LimitUsageGauge::Monthly { used_percent };
+        if let Some(spend) = limits.spend_limit.as_ref() {
+            return LimitUsageGauge::Monthly {
+                used_percent: spend.used_percent.filter(|value| value.is_finite()),
+            };
         }
     }
     LimitUsageGauge::Weekly {
@@ -6812,7 +5003,7 @@ fn format_weekly_pace_tooltip(
         pace.daily_limit_percent,
         daily_used_percent,
         pace.safe_today_percent,
-        format_account_duration(reset_secs.saturating_sub(now_clamped) as u64)
+        format_age(reset_secs.saturating_sub(now_clamped))
     ))
 }
 
@@ -6938,70 +5129,21 @@ fn render_limits_card(
     Some(WeeklyPaceHover { mouse, text })
 }
 
-fn individual_limit_for_limits(
-    limits: &crate::limits::AccountRateLimits,
-) -> Option<&crate::limits::SpendControlLimitSnapshot> {
-    limits.individual_limit.as_ref().or_else(|| {
-        limits
-            .buckets
-            .iter()
-            .find_map(|bucket| bucket.individual_limit.as_ref())
-    })
-}
-
-fn format_individual_limit_compact_lines(
-    l: &crate::limits::AccountRateLimits,
-    compact: bool,
-    formatter: DisplayFormatter<'_>,
-) -> Option<(String, String)> {
-    let individual_limit = individual_limit_for_limits(l)?;
-
-    const LABEL_W: usize = 10;
-    let remaining = individual_limit
-        .remaining_percent
-        .filter(|v| v.is_finite())
-        .map(|v| format!("{}%", v.round() as i64))
-        .unwrap_or_else(|| "--%".to_string());
-    let resets = if compact {
-        reset_compact_label(individual_limit.resets_at, formatter)
-            .map(|value| format!(" | {value}"))
-            .unwrap_or_default()
-    } else {
-        resets_label(individual_limit.resets_at, formatter)
-            .map(|value| format!(" ({value})"))
-            .unwrap_or_default()
-    };
-    let monthly = format!("{:<LABEL_W$}{remaining}{resets}", "Monthly:");
-
-    let used = individual_limit
-        .used
-        .as_deref()
-        .map(|raw| format_credit_amount(raw, formatter))
-        .unwrap_or_else(|| "--".to_string());
-    let limit = individual_limit
-        .limit
-        .as_deref()
-        .map(|raw| format_credit_amount(raw, formatter))
-        .unwrap_or_else(|| "--".to_string());
-    let used_line = format!("{:<LABEL_W$}{used}/{limit} used", "Credits:");
-    Some((monthly, used_line))
-}
-
+/// The most used scoped limit (for example one model's weekly limit).
 fn format_extra_bucket_compact_line(
     l: &crate::limits::AccountRateLimits,
     compact: bool,
     formatter: DisplayFormatter<'_>,
 ) -> Option<String> {
-    let active_id = l.limit_id.as_deref();
-    let active_name = l.limit_name.as_deref();
-    let bucket = l.buckets.iter().find(|bucket| {
-        let same_id = active_id.is_some() && bucket.limit_id.as_deref() == active_id;
-        let same_name = active_id.is_none()
-            && active_name.is_some()
-            && bucket.limit_name.as_deref() == active_name;
-        !same_id && !same_name
-    })?;
-    let window = bucket.primary.as_ref().or(bucket.secondary.as_ref())?;
+    let (bucket, window) = l
+        .buckets
+        .iter()
+        .filter_map(|bucket| Some((bucket, bucket.primary.as_ref()?)))
+        .max_by(|(_, left), (_, right)| {
+            left.used_percent
+                .unwrap_or(0.0)
+                .total_cmp(&right.used_percent.unwrap_or(0.0))
+        })?;
     let label = compact_bucket_label(bucket);
     Some(format_limit_compact_line(
         &label,
@@ -7012,13 +5154,7 @@ fn format_extra_bucket_compact_line(
 }
 
 fn compact_bucket_label(bucket: &crate::limits::RateLimitSnapshot) -> String {
-    let raw = bucket
-        .limit_name
-        .as_deref()
-        .or(bucket.limit_id.as_deref())
-        .unwrap_or("Other")
-        .trim();
-    let raw = raw.strip_prefix("GPT-").unwrap_or(raw);
+    let raw = bucket.limit_name.as_deref().unwrap_or("Other").trim();
     let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
     let cleaned = cleaned.trim();
     if cleaned.is_empty() {
@@ -7027,41 +5163,24 @@ fn compact_bucket_label(bucket: &crate::limits::RateLimitSnapshot) -> String {
     format!("{}:", truncate_middle(cleaned, 9))
 }
 
-fn format_credit_amount(raw: &str, formatter: DisplayFormatter<'_>) -> String {
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    let cleaned = cleaned.trim();
-    let number = cleaned.parse::<f64>().ok().filter(|v| v.is_finite());
-    number
-        .map(|v| format_count(v.round() as i64, formatter))
-        .unwrap_or_else(|| truncate_middle(cleaned, 12))
-}
-
-fn format_credits_compact_line(
+/// Extra (paid) usage beyond the subscription limits, when enabled.
+fn format_extra_usage_compact_line(
     l: &crate::limits::AccountRateLimits,
     formatter: DisplayFormatter<'_>,
 ) -> Option<String> {
     const LABEL_W: usize = 10;
-    let credits = l.credits.as_ref()?;
-    if !credits.has_credits {
-        return None;
-    }
-    if credits.unlimited {
-        return Some(format!("{:<LABEL_W$}Unlimited", "Credits:"));
-    }
-    let raw = credits.balance.as_deref()?.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
-    let cleaned = cleaned.trim();
-    if cleaned.is_empty() {
-        return None;
-    }
-    let n = cleaned.parse::<f64>().ok().filter(|v| v.is_finite());
-    let amount = n
-        .map(|v| format!("{} credits", formatter.format_count(v.round() as i64)))
-        .unwrap_or_else(|| format!("{cleaned} credits"));
-    Some(format!("{:<LABEL_W$}{amount}", "Credits:"))
+    let extra = l.extra_usage.as_ref().filter(|extra| extra.enabled)?;
+    let used = extra.used_amount?;
+    let currency = extra.currency.as_deref().unwrap_or("");
+    Some(
+        format!(
+            "{:<LABEL_W$}{} {currency}",
+            "Extra:",
+            formatter.format_two_decimals(used)
+        )
+        .trim_end()
+        .to_string(),
+    )
 }
 
 fn truncate_middle(value: &str, max: usize) -> String {
@@ -7231,25 +5350,28 @@ mod tests {
     fn navigation_tabs_are_clickable_on_the_outer_border() {
         let (title, targets) = navigation_title(Rect::new(4, 2, 80, 20), ActiveScreen::Activity);
 
-        assert_eq!(title.width(), 44);
-        assert_eq!(targets.len(), 5);
-        assert_eq!(targets[0].area, Rect::new(40, 2, 7, 1));
+        assert_eq!(title.width(), 36);
+        assert_eq!(targets.len(), 4);
+        assert_eq!(targets[0].area, Rect::new(48, 2, 7, 1));
         assert_eq!(
             targets[0].action,
             UiClickAction::SetScreen(ActiveScreen::Usage)
         );
-        assert_eq!(targets[1].area, Rect::new(47, 2, 9, 1));
+        assert_eq!(targets[1].area, Rect::new(55, 2, 9, 1));
         assert_eq!(
             targets[1].action,
             UiClickAction::SetScreen(ActiveScreen::ApiStat)
         );
-        assert_eq!(targets[2].area, Rect::new(56, 2, 10, 1));
+        assert_eq!(targets[2].area, Rect::new(64, 2, 10, 1));
         assert_eq!(
             targets[2].action,
             UiClickAction::SetScreen(ActiveScreen::Activity)
         );
-        assert_eq!(targets[3].area, Rect::new(66, 2, 8, 1));
-        assert_eq!(targets[4].area, Rect::new(74, 2, 9, 1));
+        assert_eq!(targets[3].area, Rect::new(74, 2, 9, 1));
+        assert_eq!(
+            targets[3].action,
+            UiClickAction::SetScreen(ActiveScreen::Read)
+        );
     }
 
     #[test]
@@ -7260,18 +5382,8 @@ mod tests {
         );
         let (navigation, targets) =
             navigation_title(Rect::new(0, 0, 80, 24), ActiveScreen::ApiStat);
-        assert_eq!(navigation.width(), 44);
-        assert_eq!(targets.len(), 5);
-    }
-
-    #[test]
-    fn api_stat_controls_reserve_the_same_reset_summary_row_as_usage() {
-        let summary = "Resets: 1 available | earliest expires Aug 13, 02:39";
-
-        assert_eq!(
-            api_stat_controls_height(Some(summary), 100),
-            usage_controls_height(Some(summary), 100, Some(7))
-        );
+        assert_eq!(navigation.width(), 36);
+        assert_eq!(targets.len(), 4);
     }
 
     #[test]
@@ -7289,92 +5401,6 @@ mod tests {
             let formatter = DisplayFormatter::new(style, &system_locale);
             assert_eq!(today_card_title(formatter, now), "TODAY_07/22/2026_14:35");
         }
-    }
-
-    #[test]
-    fn api_stats_summary_respects_display_style() {
-        let system_locale = crate::locale::SystemLocale::default();
-        let classic = DisplayFormatter::new(DisplayStyle::Classic, &system_locale);
-        let compact = DisplayFormatter::new(DisplayStyle::SystemCompact, &system_locale);
-        let full = DisplayFormatter::new(DisplayStyle::SystemFull, &system_locale);
-
-        assert_eq!(
-            format_optional_account_tokens(Some(8_206_591_409), classic),
-            "8,206,591,409"
-        );
-        assert_eq!(
-            format_optional_account_tokens(Some(8_206_591_409), compact),
-            "8.21B"
-        );
-        assert_eq!(
-            format_optional_account_tokens(Some(8_206_591_409), full),
-            "8 206 591 409"
-        );
-        assert_eq!(format_account_duration(42_168), "11h 42m 48s");
-    }
-
-    #[test]
-    fn api_stats_grouping_sums_reported_days_by_local_period() {
-        let buckets = vec![
-            crate::limits::DailyUsageBucket {
-                start_date: "2026-07-31".to_string(),
-                tokens: 10,
-            },
-            crate::limits::DailyUsageBucket {
-                start_date: "2026-08-01".to_string(),
-                tokens: 20,
-            },
-            crate::limits::DailyUsageBucket {
-                start_date: "2026-08-03".to_string(),
-                tokens: 30,
-            },
-        ];
-
-        let days = aggregate_api_stat_points(&buckets, ApiStatGrouping::Day, Weekday::Mon);
-        assert_eq!(days.len(), 3);
-        let weeks = aggregate_api_stat_points(&buckets, ApiStatGrouping::Week, Weekday::Mon);
-        assert_eq!(weeks.len(), 2);
-        assert_eq!(weeks[0].start.to_string(), "2026-07-27");
-        assert_eq!(weeks[0].end.to_string(), "2026-08-02");
-        assert_eq!(weeks[0].tokens, 30);
-        assert_eq!(weeks[0].active_days, 2);
-        assert_eq!(weeks[1].tokens, 30);
-
-        let months = aggregate_api_stat_points(&buckets, ApiStatGrouping::Month, Weekday::Mon);
-        assert_eq!(months.len(), 2);
-        assert_eq!(months[0].start.to_string(), "2026-07-01");
-        assert_eq!(months[0].end.to_string(), "2026-07-31");
-        assert_eq!(months[0].tokens, 10);
-        assert_eq!(months[1].tokens, 50);
-    }
-
-    #[test]
-    fn api_stats_week_grouping_is_always_iso_monday() {
-        let buckets = vec![crate::limits::DailyUsageBucket {
-            start_date: "2026-08-02".to_string(),
-            tokens: 42,
-        }];
-        let monday = aggregate_api_stat_points(&buckets, ApiStatGrouping::Week, Weekday::Mon);
-        let sunday = aggregate_api_stat_points(&buckets, ApiStatGrouping::Week, Weekday::Sun);
-        assert_eq!(monday[0].start.to_string(), "2026-07-27");
-        assert_eq!(sunday[0].start.to_string(), "2026-07-27");
-    }
-
-    #[test]
-    fn api_stats_week_label_keeps_both_months() {
-        let locale = crate::locale::SystemLocale::default();
-        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
-        let point = ApiStatPoint {
-            start: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
-            end: NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
-            tokens: 42,
-            active_days: 1,
-        };
-
-        assert_eq!(
-            format_api_stat_point_label(&point, ApiStatGrouping::Week, formatter),
-            "W14 (Mar 30-Apr 5)"
-        );
     }
 
     #[test]
@@ -7621,10 +5647,7 @@ mod tests {
             limits_height,
             regular_height.saturating_add(LIMITS_CARD_RESERVED_ROWS)
         );
-        assert_eq!(
-            api_stat_card_row_height(&[("LIMITS", limits), ("LIFETIME", regular)], 40),
-            limits_height
-        );
+        assert_eq!(card_row_height(&[limits, regular], 40), limits_height);
     }
 
     #[test]
@@ -7659,163 +5682,17 @@ mod tests {
     }
 
     #[test]
-    fn reset_summary_uses_earliest_returned_expiration() {
-        let system_locale = crate::locale::SystemLocale::default();
-        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
-        let limits = crate::limits::AccountRateLimits {
-            limit_id: None,
-            limit_name: None,
-            individual_limit: None,
-            primary: None,
-            secondary: None,
-            credits: None,
-            buckets: Vec::new(),
-            reset_credits_available: Some(3),
-            reset_credits: Some(vec![
-                crate::limits::RateLimitResetCredit {
-                    id: Some("later".to_string()),
-                    reset_type: Some("codexRateLimits".to_string()),
-                    status: Some("available".to_string()),
-                    granted_at: None,
-                    expires_at: Some(1_784_434_782),
-                    title: None,
-                    description: None,
-                },
-                crate::limits::RateLimitResetCredit {
-                    id: Some("earlier".to_string()),
-                    reset_type: Some("codexRateLimits".to_string()),
-                    status: Some("available".to_string()),
-                    granted_at: None,
-                    expires_at: Some(1_784_334_782),
-                    title: None,
-                    description: None,
-                },
-            ]),
-        };
-
-        let summary = reset_summary_for_limits(&limits, formatter).expect("reset summary");
-        assert!(summary.starts_with("Resets: 3 available | earliest expires "));
-        assert!(summary.contains(", "));
-    }
-
-    #[test]
-    fn reset_summary_height_accounts_for_its_label() {
-        let summary = "Resets: 3 available | earliest expires 18 Jul";
-        assert!(reset_summary_height(Some(summary), 24, None) > wrapped_line_count(summary, 24));
-        assert_eq!(usage_controls_height(None, 80, Some(7)), 1);
-        assert_eq!(activity_controls_height(None, 80), 1);
-    }
-
-    #[test]
-    fn reset_summary_uses_white_label_and_bright_accent_value() {
-        let line = reset_summary_line("Resets: 1 available", Color::LightCyan);
-
-        assert_eq!(line.spans.len(), 2);
-        assert_eq!(line.spans[0].style.fg, Some(Color::White));
-        assert_eq!(line.spans[1].style.fg, Some(Color::LightCyan));
-    }
-
-    #[test]
-    fn reset_button_is_immediately_after_the_summary_when_it_fits() {
-        let area = Rect::new(4, 6, 100, 4);
-        let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
-        let display_width = u16::try_from(UnicodeWidthStr::width(
-            reset_summary_display_text(summary).as_str(),
-        ))
-        .expect("summary width");
-
-        let layout = reset_summary_layout(area, summary, Some(7));
-
-        assert_eq!(layout.summary_area, Rect::new(4, 6, display_width, 1));
-        assert_eq!(
-            layout.button_area,
-            Some(Rect::new(4 + display_width, 6, 7, 1))
-        );
-        assert_eq!(layout.height, 2);
-    }
-
-    #[test]
-    fn reset_button_wraps_below_a_narrow_summary() {
-        let area = Rect::new(4, 6, 24, 8);
-        let summary = "Resets: 1 available | earliest expires 21 Sep, 09:04";
-
-        let layout = reset_summary_layout(area, summary, Some(7));
-
-        assert!(layout.summary_area.height > 1);
-        assert_eq!(
-            layout.button_area,
-            Some(Rect::new(4, 6 + layout.summary_area.height, 7, 1))
-        );
-        assert_eq!(layout.height, layout.summary_area.height + 2);
-    }
-
-    #[test]
-    fn limits_card_uses_monthly_and_named_rolling_bucket() {
-        let system_locale = crate::locale::SystemLocale::default();
-        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
-        let limits = crate::limits::AccountRateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            individual_limit: Some(crate::limits::SpendControlLimitSnapshot {
-                limit: Some("60000".to_string()),
-                remaining_percent: Some(99.0),
-                resets_at: None,
-                used: Some("564".to_string()),
-            }),
-            primary: None,
-            secondary: None,
-            credits: None,
-            buckets: vec![crate::limits::RateLimitSnapshot {
-                limit_id: Some("codex_bengalfox".to_string()),
-                limit_name: Some("GPT-5.3-Codex-Spark-Preview".to_string()),
-                individual_limit: None,
-                primary: Some(crate::limits::RateLimitWindow {
-                    used_percent: Some(0.0),
-                    window_duration_mins: Some(300.0),
-                    resets_at: None,
-                }),
-                secondary: Some(crate::limits::RateLimitWindow {
-                    used_percent: Some(0.0),
-                    window_duration_mins: Some(10080.0),
-                    resets_at: None,
-                }),
-                credits: None,
-            }],
-            reset_credits_available: None,
-            reset_credits: None,
-        };
-
-        let (value, caption1, caption2, caption3) =
-            format_limits_compact_card_lines(&limits, false, formatter);
-        assert_eq!(value, "Monthly:  99%");
-        assert_eq!(caption1.as_deref(), Some("Credits:  564/60,000 used"));
-        assert_eq!(caption2.as_deref(), Some("5h limit: 100%"));
-        assert_eq!(caption3.as_deref(), Some("Weekly:   100%"));
-
-        let (_, _, compact_primary, compact_secondary) =
-            format_limits_compact_card_lines(&limits, true, formatter);
-        assert_eq!(compact_primary.as_deref(), Some("5h: 100%"));
-        assert_eq!(compact_secondary.as_deref(), Some("7d: 100%"));
-    }
-
-    #[test]
     fn limits_card_treats_weekly_primary_as_weekly() {
         let system_locale = crate::locale::SystemLocale::default();
         let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
         let limits = crate::limits::AccountRateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            individual_limit: None,
             primary: Some(crate::limits::RateLimitWindow {
                 used_percent: Some(4.0),
                 window_duration_mins: Some(10080.0),
                 resets_at: None,
             }),
             secondary: None,
-            credits: None,
-            buckets: Vec::new(),
-            reset_credits_available: None,
-            reset_credits: None,
+            ..crate::limits::AccountRateLimits::empty(crate::limits::LimitsSourceKind::OAuth, 0)
         };
 
         let (short_window, weekly_window) = rolling_windows_for_limits(&limits);
@@ -8146,15 +6023,9 @@ mod tests {
         let next_day = NaiveDate::from_ymd_opt(2026, 7, 21).expect("date");
         let (weekly, now) = weekly_window(20.0, start, next_day, 0, 0);
         let limits = crate::limits::AccountRateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            individual_limit: None,
             primary: None,
             secondary: Some(weekly),
-            credits: None,
-            buckets: Vec::new(),
-            reset_credits_available: None,
-            reset_credits: None,
+            ..crate::limits::AccountRateLimits::empty(crate::limits::LimitsSourceKind::OAuth, 0)
         };
 
         let LimitUsageGauge::Weekly {
@@ -8169,22 +6040,17 @@ mod tests {
     }
 
     #[test]
-    fn monthly_only_limit_selects_a_single_segment_gauge() {
+    fn spend_limit_only_selects_a_single_segment_gauge() {
         let limits = crate::limits::AccountRateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            individual_limit: Some(crate::limits::SpendControlLimitSnapshot {
-                limit: Some("60000".to_string()),
-                remaining_percent: Some(75.0),
+            spend_limit: Some(crate::limits::RateLimitWindow {
+                used_percent: Some(25.0),
+                window_duration_mins: None,
                 resets_at: None,
-                used: Some("15000".to_string()),
             }),
-            primary: None,
-            secondary: None,
-            credits: None,
-            buckets: Vec::new(),
-            reset_credits_available: None,
-            reset_credits: None,
+            ..crate::limits::AccountRateLimits::empty(
+                crate::limits::LimitsSourceKind::StatusLine,
+                0,
+            )
         };
 
         assert_eq!(
@@ -8196,80 +6062,40 @@ mod tests {
     }
 
     #[test]
-    fn empty_rolling_window_objects_do_not_override_monthly_gauge() {
+    fn limits_card_shows_the_most_used_model_limit() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(crate::locale::DisplayStyle::Classic, &system_locale);
+        let window = |used: f64| crate::limits::RateLimitWindow {
+            used_percent: Some(used),
+            window_duration_mins: Some(crate::limits::SEVEN_DAY_WINDOW_MINS),
+            resets_at: None,
+        };
         let limits = crate::limits::AccountRateLimits {
-            limit_id: Some("codex".to_string()),
-            limit_name: None,
-            individual_limit: Some(crate::limits::SpendControlLimitSnapshot {
-                limit: None,
-                remaining_percent: Some(40.0),
-                resets_at: Some(1_788_192_000),
-                used: None,
-            }),
             primary: Some(crate::limits::RateLimitWindow {
-                used_percent: None,
-                window_duration_mins: Some(300.0),
+                used_percent: Some(10.0),
+                window_duration_mins: Some(crate::limits::FIVE_HOUR_WINDOW_MINS),
                 resets_at: None,
             }),
-            secondary: Some(crate::limits::RateLimitWindow {
-                used_percent: None,
-                window_duration_mins: Some(10_080.0),
-                resets_at: None,
-            }),
-            credits: None,
-            buckets: Vec::new(),
-            reset_credits_available: None,
-            reset_credits: None,
+            secondary: Some(window(13.0)),
+            buckets: vec![
+                crate::limits::RateLimitSnapshot {
+                    limit_name: Some("Sonnet".to_string()),
+                    primary: Some(window(5.0)),
+                },
+                crate::limits::RateLimitSnapshot {
+                    limit_name: Some("Opus".to_string()),
+                    primary: Some(window(40.0)),
+                },
+            ],
+            ..crate::limits::AccountRateLimits::empty(crate::limits::LimitsSourceKind::OAuth, 0)
         };
 
-        assert_eq!(
-            limit_usage_gauge(Some(&limits), 0),
-            LimitUsageGauge::Monthly {
-                used_percent: Some(60.0)
-            }
-        );
-    }
-
-    #[test]
-    fn top_level_monthly_limit_ignores_auxiliary_rolling_bucket() {
-        let limits = crate::limits::AccountRateLimits {
-            limit_id: Some("active-monthly".to_string()),
-            limit_name: None,
-            individual_limit: Some(crate::limits::SpendControlLimitSnapshot {
-                limit: None,
-                remaining_percent: Some(40.0),
-                resets_at: Some(1_788_192_000),
-                used: None,
-            }),
-            primary: None,
-            secondary: None,
-            credits: None,
-            buckets: vec![crate::limits::RateLimitSnapshot {
-                limit_id: Some("auxiliary-rolling".to_string()),
-                limit_name: None,
-                individual_limit: None,
-                primary: Some(crate::limits::RateLimitWindow {
-                    used_percent: Some(10.0),
-                    window_duration_mins: Some(300.0),
-                    resets_at: None,
-                }),
-                secondary: Some(crate::limits::RateLimitWindow {
-                    used_percent: Some(20.0),
-                    window_duration_mins: Some(10_080.0),
-                    resets_at: None,
-                }),
-                credits: None,
-            }],
-            reset_credits_available: None,
-            reset_credits: None,
-        };
-
-        assert_eq!(
-            limit_usage_gauge(Some(&limits), 0),
-            LimitUsageGauge::Monthly {
-                used_percent: Some(60.0)
-            }
-        );
+        let (value, caption1, caption2, caption3) =
+            format_limits_compact_card_lines(&limits, false, formatter);
+        assert_eq!(value, "5h limit: 90%");
+        assert_eq!(caption1.as_deref(), Some("Weekly:   87%"));
+        assert_eq!(caption2.as_deref(), Some("Opus:     60%"));
+        assert_eq!(caption3, None);
     }
 
     #[test]
@@ -8451,6 +6277,95 @@ mod tests {
             hover_tooltip_rect_with_horizontal_padding(Rect::new(2, 2, 20, 10), (20, 3), 10, 3, 1),
             Some(Rect::new(6, 4, 14, 5))
         );
+    }
+
+    fn test_usage_snapshot() -> crate::usage::LocalUsageSnapshot {
+        let totals = crate::usage::UsageTotalsTokens {
+            last7_days_tokens: 0,
+            last30_days_tokens: 0,
+            average_daily_tokens: 0,
+            cache_hit_rate_percent: 0.0,
+            peak_day: None,
+            peak_day_tokens: 0,
+        };
+        crate::usage::LocalUsageSnapshot {
+            days: Vec::new(),
+            totals: totals.clone(),
+            top_models: Vec::new(),
+            utc_days: Vec::new(),
+            utc_totals: totals,
+            utc_top_models: Vec::new(),
+            activity_first_weekday: Weekday::Mon,
+            model_daily: Vec::new(),
+            utc_model_daily: Vec::new(),
+            project_activity: Vec::new(),
+            project_usage: Vec::new(),
+            matched_session_files: 0,
+            scan_total_files: 0,
+            scan_indexed_files: 0,
+            scan_pending_files: 0,
+            scan_processed_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn models_table_text_lists_models_with_four_columns() {
+        let system_locale = crate::locale::SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &system_locale);
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let tokens = |input, cache_write, cache_read, output| crate::usage::TokenBreakdown {
+            input,
+            cache_write,
+            cache_read,
+            output,
+        };
+        let series =
+            |model: &str, value: crate::usage::TokenBreakdown| crate::usage::ModelDailyUsage {
+                model: model.to_string(),
+                days: [(today.clone(), value)].into_iter().collect(),
+            };
+        let snapshot = crate::usage::LocalUsageSnapshot {
+            days: vec![UsageDay {
+                day: today.clone(),
+                ..UsageDay::default()
+            }],
+            model_daily: vec![
+                series("claude-opus-5-5", tokens(1_000, 2_000, 3_000, 4_000)),
+                series("claude-sonnet-5", tokens(0, 0, 0, 10_000)),
+            ],
+            ..test_usage_snapshot()
+        };
+
+        let text = apistat::models_table_text(
+            &snapshot,
+            UsageZone::Local,
+            crate::app::ModelsRange::Last7Days,
+            formatter,
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("claudemon models: Last 7 days (local time"));
+        assert!(lines[1].starts_with("Model"));
+        assert!(lines[2].starts_with("Opus 5.5"));
+        assert!(lines[2].contains("50.0%"));
+        assert!(lines[2].ends_with("10,000"));
+        assert!(lines[3].starts_with("Sonnet 5"));
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn age_labels_are_compact() {
+        assert_eq!(format_age(42), "42s");
+        assert_eq!(format_age(12 * 60 + 5), "12m");
+        assert_eq!(format_age(3 * 3600 + 5 * 60), "3h 5m");
+        assert_eq!(format_age(2 * 86_400 + 4 * 3600), "2d 4h");
     }
 
     #[test]

@@ -4,7 +4,7 @@ use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc, Week
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -20,7 +20,7 @@ const DEFAULT_SCAN_TIME_BUDGET_MS: u64 = 1500;
 const MAX_DISTINCT_MODELS: usize = 5_000;
 // v14: each session has one immutable owner cwd. Derived cache rows from
 // earlier schemas can contain mutable-context or git-collapsed attribution.
-const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 1;
+const SCAN_CACHE_DB_SCHEMA_VERSION: i64 = 2;
 pub(crate) const PROJECT_IDENTITY_LINE_LIMIT: usize = 128;
 const MAX_OWNER_IDENTITY_LINE_BYTES: usize = 512 * 1024;
 pub const DEFAULT_SCAN_CACHE_MAX_ENTRIES: usize = 50_000;
@@ -267,6 +267,10 @@ pub struct LocalUsageSnapshot {
     pub utc_totals: UsageTotalsTokens,
     pub utc_top_models: Vec<LocalUsageModel>,
     pub activity_first_weekday: Weekday,
+    /// Per-model daily usage over the complete indexed history, largest
+    /// model first.
+    pub model_daily: Vec<ModelDailyUsage>,
+    pub utc_model_daily: Vec<ModelDailyUsage>,
     pub project_activity: Vec<ProjectActivity>,
     pub project_usage: Vec<ProjectUsageSummary>,
     // Number of session files that were identified as belonging to the selected workspace filter.
@@ -302,6 +306,13 @@ impl LocalUsageSnapshot {
         match zone {
             UsageZone::Local => &self.days,
             UsageZone::Utc => &self.utc_days,
+        }
+    }
+
+    pub fn model_daily_for_zone(&self, zone: UsageZone) -> &[ModelDailyUsage] {
+        match zone {
+            UsageZone::Local => &self.model_daily,
+            UsageZone::Utc => &self.utc_model_daily,
         }
     }
 
@@ -488,21 +499,52 @@ impl DailyTotals {
     }
 }
 
-/// Token usage of one Claude API response (`message.usage`).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct TokenUsage {
-    input: i64,
-    cache_write: i64,
-    cache_read: i64,
-    output: i64,
+/// Token usage split into the four billed categories.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenBreakdown {
+    #[serde(default)]
+    pub input: i64,
+    #[serde(default)]
+    pub cache_write: i64,
+    #[serde(default)]
+    pub cache_read: i64,
+    #[serde(default)]
+    pub output: i64,
 }
 
-impl TokenUsage {
-    fn total(self) -> i64 {
+impl TokenBreakdown {
+    pub fn total(self) -> i64 {
         self.input
             .saturating_add(self.cache_write)
             .saturating_add(self.cache_read)
             .saturating_add(self.output)
+    }
+
+    pub fn add(&mut self, other: TokenBreakdown) {
+        self.input = self.input.saturating_add(other.input);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.output = self.output.saturating_add(other.output);
+    }
+}
+
+/// Daily token usage of one model, keyed by `YYYY-MM-DD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelDailyUsage {
+    pub model: String,
+    pub days: BTreeMap<String, TokenBreakdown>,
+}
+
+impl ModelDailyUsage {
+    /// Usage on days `>= first_day` (all days when `None`).
+    pub fn total_since(&self, first_day: Option<&str>) -> TokenBreakdown {
+        let mut total = TokenBreakdown::default();
+        for (day, tokens) in &self.days {
+            if first_day.is_none_or(|first| day.as_str() >= first) {
+                total.add(*tokens);
+            }
+        }
+        total
     }
 }
 
@@ -551,7 +593,7 @@ struct CachedFileScanEntry {
     #[serde(default)]
     daily: HashMap<String, DailyTotals>,
     #[serde(default)]
-    model_totals_by_day: HashMap<String, HashMap<String, i64>>,
+    model_totals_by_day: HashMap<String, HashMap<String, TokenBreakdown>>,
     updated_at: i64,
 }
 
@@ -562,7 +604,7 @@ struct FileScanSummary {
     file_offset: u64,
     fully_parsed: bool,
     daily: HashMap<String, DailyTotals>,
-    model_totals_by_day: HashMap<String, HashMap<String, i64>>,
+    model_totals_by_day: HashMap<String, HashMap<String, TokenBreakdown>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -663,6 +705,7 @@ pub fn compute_snapshot(
             activity_day_keys,
             project_activity,
             Vec::new(),
+            (Vec::new(), Vec::new()),
             0,
             0,
             0,
@@ -1023,6 +1066,13 @@ pub fn compute_snapshot(
         &archived_cache_paths,
         &scan_cache_store,
     );
+    let model_daily = build_model_daily(
+        candidate_paths
+            .iter()
+            .chain(&archived_cache_paths)
+            .filter_map(|path| scan_cache_store.entries.get(path)),
+        workspace_path,
+    );
 
     Ok(build_snapshot(
         chart_day_keys,
@@ -1036,6 +1086,7 @@ pub fn compute_snapshot(
         activity_day_keys,
         project_activity,
         project_usage,
+        model_daily,
         scan_total_files,
         scan_indexed_files,
         scan_pending_files,
@@ -1124,6 +1175,7 @@ fn build_snapshot(
     activity_day_keys: Vec<String>,
     project_activity: HashMap<String, ProjectActivityBuilder>,
     project_usage: Vec<ProjectUsageSummary>,
+    model_daily: (Vec<ModelDailyUsage>, Vec<ModelDailyUsage>),
     scan_total_files: usize,
     scan_indexed_files: usize,
     scan_pending_files: usize,
@@ -1141,6 +1193,8 @@ fn build_snapshot(
         utc_totals,
         utc_top_models,
         activity_first_weekday,
+        model_daily: model_daily.0,
+        utc_model_daily: model_daily.1,
         project_activity: build_project_activity(activity_day_keys, project_activity),
         project_usage,
         matched_session_files,
@@ -1279,6 +1333,61 @@ fn build_project_usage_summaries(
         .collect::<Vec<_>>();
     out.sort_by(|left, right| left.display_path.cmp(&right.display_path));
     out
+}
+
+/// Per-model daily usage (local and UTC) from cache rows, honoring the
+/// workspace filter.
+fn build_model_daily<'a>(
+    entries: impl Iterator<Item = &'a CachedFileScanEntry>,
+    workspace_path: Option<&Path>,
+) -> (Vec<ModelDailyUsage>, Vec<ModelDailyUsage>) {
+    let mut local: HashMap<String, BTreeMap<String, TokenBreakdown>> = HashMap::new();
+    let mut utc: HashMap<String, BTreeMap<String, TokenBreakdown>> = HashMap::new();
+    for entry in entries {
+        if let Some(filter) = workspace_path {
+            if !entry_project_paths(entry)
+                .iter()
+                .any(|project| path_matches_workspace(project, filter))
+            {
+                continue;
+            }
+        }
+        for (cache_key, models) in &entry.model_totals_by_day {
+            let Some((zone, day)) = split_cache_day_key(cache_key) else {
+                continue;
+            };
+            let target = match zone {
+                UsageZone::Local => &mut local,
+                UsageZone::Utc => &mut utc,
+            };
+            for (model, tokens) in models {
+                if model == "unknown" {
+                    continue;
+                }
+                target
+                    .entry(model.clone())
+                    .or_default()
+                    .entry(day.to_string())
+                    .or_default()
+                    .add(*tokens);
+            }
+        }
+    }
+    let finish = |map: HashMap<String, BTreeMap<String, TokenBreakdown>>| {
+        let mut out: Vec<ModelDailyUsage> = map
+            .into_iter()
+            .map(|(model, days)| ModelDailyUsage { model, days })
+            .collect();
+        out.sort_by(|left, right| {
+            right
+                .total_since(None)
+                .total()
+                .cmp(&left.total_since(None).total())
+                .then_with(|| left.model.cmp(&right.model))
+        });
+        out
+    };
+    (finish(local), finish(utc))
 }
 
 fn entry_project_paths(entry: &CachedFileScanEntry) -> Vec<String> {
@@ -1422,7 +1531,7 @@ fn apply_cached_file_entry(
             continue;
         }
         for (model, tokens) in per_day_models {
-            add_model_tokens_limited(target, model.clone(), *tokens);
+            add_model_tokens_limited(target, model.clone(), tokens.total());
         }
     }
 
@@ -1531,7 +1640,7 @@ fn parse_file_summary(
     }
     let mut daily: HashMap<String, DailyTotals> =
         resumed.map(|entry| entry.daily.clone()).unwrap_or_default();
-    let mut model_totals_by_day: HashMap<String, HashMap<String, i64>> = resumed
+    let mut model_totals_by_day: HashMap<String, HashMap<String, TokenBreakdown>> = resumed
         .map(|entry| entry.model_totals_by_day.clone())
         .unwrap_or_default();
     let mut state = resumed
@@ -1633,7 +1742,7 @@ fn parse_file_summary(
 }
 
 /// Returns the dedupe key, model, and usage of an `assistant` record.
-fn extract_assistant_usage(value: &Value) -> Option<(String, String, TokenUsage)> {
+fn extract_assistant_usage(value: &Value) -> Option<(String, String, TokenBreakdown)> {
     let message = value.get("message")?.as_object()?;
     let model = message
         .get("model")
@@ -1650,7 +1759,7 @@ fn extract_assistant_usage(value: &Value) -> Option<(String, String, TokenUsage)
             .unwrap_or(0)
             .max(0)
     };
-    let tokens = TokenUsage {
+    let tokens = TokenBreakdown {
         input: read("input_tokens"),
         cache_write: read("cache_creation_input_tokens"),
         cache_read: read("cache_read_input_tokens"),
@@ -1676,10 +1785,10 @@ fn extract_assistant_usage(value: &Value) -> Option<(String, String, TokenUsage)
 
 fn add_token_usage(
     daily: &mut HashMap<String, DailyTotals>,
-    model_totals_by_day: &mut HashMap<String, HashMap<String, i64>>,
+    model_totals_by_day: &mut HashMap<String, HashMap<String, TokenBreakdown>>,
     timestamp_ms: i64,
     model: &str,
-    usage: TokenUsage,
+    usage: TokenBreakdown,
 ) {
     for zone in [UsageZone::Local, UsageZone::Utc] {
         let Some(day_key) = cache_day_key_for_timestamp_ms(timestamp_ms, zone) else {
@@ -1692,11 +1801,13 @@ fn add_token_usage(
             output: usage.output,
             ..DailyTotals::default()
         });
-        add_model_tokens_limited(
-            model_totals_by_day.entry(day_key).or_default(),
-            model.to_string(),
-            usage.total(),
-        );
+        let models = model_totals_by_day.entry(day_key).or_default();
+        let key = if models.len() < MAX_DISTINCT_MODELS || models.contains_key(model) {
+            model.to_string()
+        } else {
+            "other".to_string()
+        };
+        models.entry(key).or_default().add(usage);
     }
 }
 
@@ -1969,9 +2080,10 @@ fn load_scan_cache_store(db: &ScanCacheDb) -> Result<(ScanCacheStore, HashSet<St
                 continue;
             }
         };
-        let model_totals_by_day = match serde_json::from_str::<HashMap<String, HashMap<String, i64>>>(
-            &model_daily_json,
-        ) {
+        let model_totals_by_day = match serde_json::from_str::<
+            HashMap<String, HashMap<String, TokenBreakdown>>,
+        >(&model_daily_json)
+        {
             Ok(value) => value,
             Err(_) => {
                 invalid_paths.insert(file_path);
@@ -3625,6 +3737,35 @@ mod tests {
             owner.session_id.as_deref(),
             Some("00000000-0000-4000-8000-000000000001")
         );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn model_daily_usage_keeps_four_categories_per_model_and_day() {
+        let root = make_temp_dir("model-daily");
+        let (claude_dir, sessions_root) = make_claude_dir(&root);
+        let path = sessions_root.join("session.jsonl");
+        let now_ms = Utc::now().timestamp_millis();
+        append_usage_line(&path, now_ms, TEST_PROJECT_CWD, [1, 2, 3, 4]);
+        append_usage_line(&path, now_ms + 1, TEST_PROJECT_CWD, [10, 20, 30, 40]);
+
+        let snapshot = compute_snapshot(30, &claude_dir, None, default_test_limits(false), None)
+            .expect("snapshot");
+        let models = snapshot.model_daily_for_zone(UsageZone::Utc);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "claude-test-1");
+        let total = models[0].total_since(None);
+        assert_eq!(
+            total,
+            TokenBreakdown {
+                input: 11,
+                cache_write: 22,
+                cache_read: 33,
+                output: 44,
+            }
+        );
+        assert_eq!(models[0].total_since(Some("9999-01-01")).total(), 0);
 
         let _ = std::fs::remove_dir_all(root);
     }
