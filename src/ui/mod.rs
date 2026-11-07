@@ -105,6 +105,24 @@ pub fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(terminal)
 }
 
+/// Hands the terminal to a child process (normal screen, cooked mode).
+pub(crate) fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    restore_terminal(terminal)
+}
+
+/// Takes the terminal back after a child process exits and forces a full
+/// redraw on the next frame.
+pub(crate) fn resume_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
+    terminal.clear()?;
+    Ok(())
+}
+
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(

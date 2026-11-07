@@ -1,4 +1,5 @@
 mod app;
+mod launch;
 mod limits;
 mod locale;
 mod pricing;
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 
-const USER_CONFIG_SCHEMA_VERSION: u32 = 4;
+const USER_CONFIG_SCHEMA_VERSION: u32 = 6;
 const USER_CONFIG_FILE_NAME: &str = "config.json";
 const DEFAULT_USAGE_DAYS: u32 = 30;
 const DEFAULT_REFRESH_USAGE_SECS: u64 = 300;
@@ -51,6 +52,13 @@ struct UserConfig {
     pricing: std::collections::BTreeMap<String, pricing::ModelPrice>,
     /// Date the price table was last reviewed.
     pricing_updated: String,
+    /// Command that opens a resumed session in a new terminal window, run
+    /// through the shell with `{cwd}`, `{session_id}`, and `{command}`
+    /// replaced. When both custom commands are unset, tmux, Windows
+    /// Terminal, or Terminal.app is detected automatically.
+    resume_terminal_command: Option<String>,
+    /// Same as `resume_terminal_command`, for opening a new tab.
+    resume_terminal_tab_command: Option<String>,
 }
 
 impl Default for UserConfig {
@@ -77,6 +85,8 @@ impl Default for UserConfig {
             live_limits: LiveLimitsArg::Statusline,
             pricing: pricing::default_prices(),
             pricing_updated: pricing::DEFAULT_PRICING_UPDATED.to_string(),
+            resume_terminal_command: None,
+            resume_terminal_tab_command: None,
         }
     }
 }
@@ -395,6 +405,10 @@ async fn main() -> Result<()> {
 
     let config = app::Config {
         live_limits_mode: args.live_limits.unwrap_or(user_config.live_limits).into(),
+        resume_launcher: launch::Launcher::detect(
+            user_config.resume_terminal_command.as_deref(),
+            user_config.resume_terminal_tab_command.as_deref(),
+        ),
         pricing: pricing::PriceTable {
             prices: user_config.pricing.clone(),
             updated: user_config.pricing_updated.clone(),

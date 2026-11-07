@@ -42,3 +42,9 @@ All notable changes to this project are documented in this file.
 - UI polish: orange default theme, clearer empty and not-configured states,
   COST tab in the navigation, updated help and key hints; `ctrl+s` no
   longer switches screens.
+- HISTORY shows a Resume box with `cd <launch dir> && claude --resume <id>`
+  for the selected session. Enter or double-click opens it in a new
+  terminal window and `t` in a new tab (Windows Terminal, tmux,
+  Terminal.app, or `resume_terminal_command` / `resume_terminal_tab_command`
+  from config.json) while claudemon stays open; `i` resumes it in the
+  current terminal; `y` copies the command.

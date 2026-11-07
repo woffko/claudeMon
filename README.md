@@ -69,8 +69,19 @@ never stored or refreshed by claudemon.
   (`d` cycles dates). Prices are in `~/.claudemon/config.json` under
   `pricing` (USD per million tokens) and can be edited.
 - **ACTIVITY** - per-project activity heatmaps.
-- **HISTORY** - sessions grouped by project, with titles, token usage, and
-  the `claude --resume` command.
+- **HISTORY** - sessions grouped by project, with titles and token usage.
+  The Resume box shows the command for the selected session (for example
+  `cd ~/project && claude --resume <id>`). Enter or double-click opens the
+  session in a new terminal window, `t` in a new tab of the current window;
+  claudemon stays open. `i` runs it in the current terminal and returns when
+  Claude Code exits; `y` copies the command. Windows Terminal (WSL or
+  Windows) supports windows and tabs, tmux opens a tmux window (tab), and
+  Terminal.app (macOS) opens a window. Other terminals can be set in
+  `~/.claudemon/config.json` with `resume_terminal_command` (window) and
+  `resume_terminal_tab_command` (tab), for example
+  `"gnome-terminal --working-directory={cwd} -- bash -ic {command}"`
+  (`{cwd}`, `{session_id}`, and `{command}` are shell-quoted).
+
 
 Usage history is kept in claudemon's cache even after Claude Code deletes old
 transcripts (`cleanupPeriodDays`, 30 days by default).

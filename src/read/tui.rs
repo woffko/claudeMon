@@ -1,3 +1,4 @@
+use crate::launch::Placement;
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::read::catalog::{
     CatalogProgress, CatalogScanPhase, CatalogSnapshot, ProjectViewMode, SOURCE_NOISY_TREE,
@@ -43,6 +44,29 @@ enum BrowserClickTarget {
 struct UiLayout {
     project_list_area: Rect,
     session_list_area: Rect,
+    window_button: Rect,
+    tab_button: Rect,
+    here_button: Rect,
+    copy_button: Rect,
+}
+
+/// A request from the session browser that the app carries out: resuming a
+/// session in a new window or tab, in this terminal, or copying the command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SessionAction {
+    /// Open the session in a new terminal window or tab; claudemon stays
+    /// open.
+    ResumeExternal {
+        cwd: PathBuf,
+        session_id: String,
+        placement: Placement,
+    },
+    /// Run the session in this terminal until Claude Code exits.
+    ResumeHere {
+        cwd: PathBuf,
+        session_id: String,
+    },
+    Copy(String),
 }
 
 #[derive(Debug)]
@@ -66,6 +90,11 @@ pub(crate) struct BrowserState {
     error: Option<String>,
     layout: UiLayout,
     last_click: Option<(BrowserClickTarget, Instant)>,
+    pending_action: Option<SessionAction>,
+    resume_notice: Option<String>,
+    /// Whether the terminal launcher can open new windows / new tabs.
+    can_open_window: bool,
+    can_open_tab: bool,
 }
 
 impl BrowserState {
@@ -112,6 +141,10 @@ impl BrowserState {
             error: None,
             layout: UiLayout::default(),
             last_click: None,
+            pending_action: None,
+            resume_notice: None,
+            can_open_window: false,
+            can_open_tab: false,
         }
     }
 
@@ -333,6 +366,81 @@ impl BrowserState {
         Ok(())
     }
 
+    /// Takes the action requested by the last input event, if any.
+    pub(crate) fn take_pending_action(&mut self) -> Option<SessionAction> {
+        self.pending_action.take()
+    }
+
+    pub(crate) fn set_launch_support(&mut self, window: bool, tab: bool) {
+        self.can_open_window = window;
+        self.can_open_tab = tab;
+    }
+
+    pub(crate) fn set_resume_notice(&mut self, notice: String) {
+        self.resume_notice = Some(notice);
+    }
+
+    /// Drops the cached detail of the selected session so it is reloaded
+    /// (for example after the session was resumed and grew).
+    pub(crate) fn invalidate_selected_session_detail(&mut self) {
+        if let Some(path) = self
+            .selected_session()
+            .map(|session| session.file_path.clone())
+        {
+            self.session_details.remove(&path);
+        }
+        try_load_selected_session_detail(self);
+    }
+
+    /// Resumes the selected session in a new window or tab when `placement`
+    /// is given, otherwise in this terminal.
+    fn request_resume(&mut self, placement: Option<Placement>) -> bool {
+        let Some(session) = self.selected_session() else {
+            return false;
+        };
+        self.pending_action = match resume_target(session) {
+            Some((cwd, session_id)) if cwd.is_dir() => {
+                self.resume_notice = None;
+                Some(match placement {
+                    Some(placement) => SessionAction::ResumeExternal {
+                        cwd,
+                        session_id,
+                        placement,
+                    },
+                    None => SessionAction::ResumeHere { cwd, session_id },
+                })
+            }
+            Some((cwd, _)) => {
+                self.resume_notice = Some(format!("Directory no longer exists: {}", cwd.display()));
+                None
+            }
+            None => {
+                self.resume_notice = Some("This session cannot be resumed.".to_string());
+                None
+            }
+        };
+        true
+    }
+
+    /// Enter / double-click: a new window, else a new tab, else here.
+    fn default_placement(&self) -> Option<Placement> {
+        if self.can_open_window {
+            Some(Placement::Window)
+        } else if self.can_open_tab {
+            Some(Placement::Tab)
+        } else {
+            None
+        }
+    }
+
+    fn request_copy(&mut self) -> bool {
+        let Some(command) = self.selected_session().and_then(resume_command) else {
+            return false;
+        };
+        self.pending_action = Some(SessionAction::Copy(command));
+        true
+    }
+
     fn register_click(&mut self, target: BrowserClickTarget, now: Instant) -> bool {
         let is_double = self.last_click.is_some_and(|(previous, at)| {
             previous == target
@@ -343,6 +451,70 @@ impl BrowserState {
         self.last_click = if is_double { None } else { Some((target, now)) };
         is_double
     }
+}
+
+/// Directory and session id to resume, when the session has a resolved
+/// launch directory and a Claude Code session id.
+fn resume_target(session: &SessionSummary) -> Option<(PathBuf, String)> {
+    let cwd = PathBuf::from(&session.cwd);
+    if !cwd.is_absolute() || !is_session_id(&session.session_id) {
+        return None;
+    }
+    Some((cwd, session.session_id.clone()))
+}
+
+fn is_session_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
+}
+
+/// Shell command that resumes the session from its launch directory, for
+/// example `cd ~/project && claude --resume <id>`.
+pub(crate) fn resume_command(session: &SessionSummary) -> Option<String> {
+    let (cwd, session_id) = resume_target(session)?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    Some(format_resume_command(&cwd, &session_id, home.as_deref()))
+}
+
+fn format_resume_command(
+    cwd: &std::path::Path,
+    session_id: &str,
+    home: Option<&std::path::Path>,
+) -> String {
+    if cfg!(windows) {
+        return format!(
+            "cd /d \"{}\" && claude --resume {session_id}",
+            cwd.display()
+        );
+    }
+    let shell_safe = |text: &str| {
+        !text.is_empty()
+            && text
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+@%:,=".contains(&byte))
+    };
+    let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+    let relative = home
+        .filter(|home| home.is_absolute() && *home != std::path::Path::new("/"))
+        .and_then(|home| cwd.strip_prefix(home).ok())
+        .map(|rest| rest.display().to_string());
+    let target = match relative {
+        Some(rest) if rest.is_empty() => "~".to_string(),
+        Some(rest) if shell_safe(&rest) => format!("~/{rest}"),
+        Some(rest) => format!("~/{}", quote(&rest)),
+        None => {
+            let full = cwd.display().to_string();
+            if shell_safe(&full) {
+                full
+            } else {
+                quote(&full)
+            }
+        }
+    };
+    format!("cd {target} && claude --resume {session_id}")
 }
 
 #[derive(Default)]
@@ -593,6 +765,24 @@ fn handle_key_event(state: &mut BrowserState, code: KeyCode) -> bool {
             jump_to_edge(state, false);
             return true;
         }
+        KeyCode::Char('y') | KeyCode::Char('Y') if state.view == ViewMode::Sessions => {
+            return state.request_copy();
+        }
+        KeyCode::Char('i') | KeyCode::Char('I')
+            if state.view == ViewMode::Sessions && state.selected_session().is_some() =>
+        {
+            return state.request_resume(None);
+        }
+        KeyCode::Char('t') | KeyCode::Char('T')
+            if state.view == ViewMode::Sessions && state.selected_session().is_some() =>
+        {
+            if state.can_open_tab {
+                return state.request_resume(Some(Placement::Tab));
+            }
+            state.resume_notice =
+                Some("This terminal cannot open tabs; use Enter or i.".to_string());
+            return true;
+        }
         KeyCode::Enter | KeyCode::Right => {
             if state.view == ViewMode::Projects && state.selected_project().is_some() {
                 open_selected_project(state);
@@ -601,6 +791,8 @@ fn handle_key_event(state: &mut BrowserState, code: KeyCode) -> bool {
             if state.view == ViewMode::Sessions {
                 if state.session_state.selected() == Some(0) {
                     close_selected_project(state);
+                } else if code == KeyCode::Enter {
+                    return state.request_resume(state.default_placement());
                 } else {
                     try_load_selected_session_detail(state);
                 }
@@ -641,11 +833,27 @@ fn handle_mouse_event(state: &mut BrowserState, mouse: MouseEvent) -> bool {
                     return true;
                 }
             }
+            if rect_contains(state.layout.window_button, mouse.column, mouse.row) {
+                return state.request_resume(Some(Placement::Window));
+            }
+            if rect_contains(state.layout.tab_button, mouse.column, mouse.row) {
+                return state.request_resume(Some(Placement::Tab));
+            }
+            if rect_contains(state.layout.here_button, mouse.column, mouse.row) {
+                return state.request_resume(None);
+            }
+            if rect_contains(state.layout.copy_button, mouse.column, mouse.row) {
+                return state.request_copy();
+            }
             if rect_contains(state.layout.session_list_area, mouse.column, mouse.row) {
                 if let Some(target) = click_session_row(state, mouse.row) {
                     let double_click = state.register_click(target, now);
+                    state.resume_notice = None;
                     if target == BrowserClickTarget::Parent && double_click {
                         close_selected_project(state);
+                    } else if double_click {
+                        try_load_selected_session_detail(state);
+                        return state.request_resume(state.default_placement());
                     } else {
                         try_load_selected_session_detail(state);
                     }
@@ -1017,7 +1225,7 @@ fn render_projects_view(
 
     UiLayout {
         project_list_area: columns[0],
-        session_list_area: Rect::default(),
+        ..UiLayout::default()
     }
 }
 
@@ -1113,6 +1321,23 @@ fn render_sessions_view(
         .highlight_symbol(">> ");
     frame.render_stateful_widget(list, columns[0], &mut state.session_state);
 
+    let command = state.selected_session().and_then(resume_command);
+    let command_width = command.as_deref().map(UnicodeWidthStr::width).unwrap_or(0);
+    let inner_width = usize::from(columns[1].width.saturating_sub(2)).max(1);
+    let command_rows = command_width.div_ceil(inner_width).max(1) as u16;
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(command_rows + 3), Constraint::Min(0)])
+        .split(columns[1]);
+    let buttons = render_resume_box(
+        frame,
+        right[0],
+        command.as_deref(),
+        state.resume_notice.as_deref(),
+        (state.can_open_window, state.can_open_tab),
+        accent_color,
+    );
+
     let detail_text = render_session_detail(
         state.selected_session(),
         state.selected_session_detail(),
@@ -1126,13 +1351,131 @@ fn render_sessions_view(
                     .title(" Session Detail "),
             )
             .wrap(Wrap { trim: false }),
-        columns[1],
+        right[1],
     );
 
     UiLayout {
         project_list_area: Rect::default(),
         session_list_area: columns[0],
+        window_button: buttons.window,
+        tab_button: buttons.tab,
+        here_button: buttons.here,
+        copy_button: buttons.copy,
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ResumeButtons {
+    window: Rect,
+    tab: Rect,
+    here: Rect,
+    copy: Rect,
+}
+
+/// Box with the resume command and its buttons: NEW WINDOW and NEW TAB when
+/// the terminal launcher supports them, HERE (this terminal), and COPY.
+/// Enter takes the first of them. Returns the button areas for mouse hit
+/// testing.
+fn render_resume_box(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    command: Option<&str>,
+    notice: Option<&str>,
+    (can_window, can_tab): (bool, bool),
+    accent_color: Color,
+) -> ResumeButtons {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Resume ")
+        .border_style(Style::default().fg(accent_color));
+    let inner = inner_rect(area);
+    frame.render_widget(block, area);
+    let Some(command) = command else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "This session cannot be resumed (no launch directory or session id).",
+                Style::default().fg(Color::Gray),
+            ))
+            .wrap(Wrap { trim: true }),
+            inner,
+        );
+        return ResumeButtons::default();
+    };
+    let command_height = inner.height.saturating_sub(1);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            command.to_string(),
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .wrap(Wrap { trim: false }),
+        Rect::new(inner.x, inner.y, inner.width, command_height),
+    );
+
+    #[derive(Clone, Copy)]
+    enum Button {
+        Window,
+        Tab,
+        Here,
+        Copy,
+    }
+    let mut entries: Vec<(Button, &str, &str)> = Vec::new();
+    if can_window {
+        entries.push((Button::Window, " NEW WINDOW ", "Enter"));
+    }
+    if can_tab {
+        entries.push((Button::Tab, " NEW TAB ", "t"));
+    }
+    let here_label = if can_window || can_tab {
+        " HERE "
+    } else {
+        " RUN "
+    };
+    entries.push((Button::Here, here_label, "i"));
+    entries.push((Button::Copy, " COPY ", "y"));
+
+    let buttons_y = inner.y.saturating_add(command_height);
+    let button_style = Style::default()
+        .fg(Color::Black)
+        .bg(accent_color)
+        .add_modifier(Modifier::BOLD);
+    let hint_style = Style::default().fg(Color::Gray);
+    let mut spans = Vec::new();
+    let mut buttons = ResumeButtons::default();
+    let mut x = inner.x;
+    for (index, (button, label, key)) in entries.iter().enumerate() {
+        // Enter triggers the first button.
+        let hint = if index == 0 && *key != "Enter" {
+            format!(" Enter/{key}  ")
+        } else {
+            format!(" {key}  ")
+        };
+        let width = UnicodeWidthStr::width(*label) as u16;
+        let area = Rect::new(x, buttons_y, width, 1);
+        match button {
+            Button::Window => buttons.window = area,
+            Button::Tab => buttons.tab = area,
+            Button::Here => buttons.here = area,
+            Button::Copy => buttons.copy = area,
+        }
+        x = x
+            .saturating_add(width)
+            .saturating_add(UnicodeWidthStr::width(hint.as_str()) as u16);
+        spans.push(Span::styled(*label, button_style));
+        spans.push(Span::styled(hint, hint_style));
+    }
+    if let Some(notice) = notice {
+        spans.push(Span::styled(
+            format!(" {notice}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(inner.x, buttons_y, inner.width, 1),
+    );
+    buttons
 }
 
 fn render_project_detail(
@@ -1379,12 +1722,6 @@ fn render_session_detail(
         ]));
     }
 
-    lines.push(Line::from(vec![
-        Span::styled("RESUME", Style::default().fg(Color::Gray)),
-        Span::raw("  "),
-        Span::raw(format!("claude --resume {}", session.session_id)),
-    ]));
-
     if !session.subagent_files.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("SUBAGENTS", Style::default().fg(Color::Gray)),
@@ -1505,7 +1842,7 @@ fn render_footer(
             "Projects: [p] mode, [+/-] depth, [space] select in FULL, wheel, double-click/enter open, r/F5 discover/refresh"
         }
         ViewMode::Sessions => {
-            "Sessions: up/down or wheel, double-click .. / backspace / left / esc back, q quit"
+            "Sessions: up/down or wheel, Enter / double-click resume in a new window, t new tab, i here, y copy command, backspace / left / esc back, q quit"
         }
     };
     let error = state
@@ -1616,6 +1953,35 @@ fn rect_contains(area: Rect, column: u16, row: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(windows))]
+    #[test]
+    fn resume_command_uses_home_shorthand_and_quotes_unsafe_paths() {
+        use super::format_resume_command;
+        use std::path::Path;
+        let id = "00000000-0000-4000-8000-000000000001";
+        let home = Some(Path::new("/home/user"));
+        assert_eq!(
+            format_resume_command(Path::new("/home/user/comon"), id, home),
+            format!("cd ~/comon && claude --resume {id}")
+        );
+        assert_eq!(
+            format_resume_command(Path::new("/home/user"), id, home),
+            format!("cd ~ && claude --resume {id}")
+        );
+        assert_eq!(
+            format_resume_command(Path::new("/home/user/my project"), id, home),
+            format!("cd ~/'my project' && claude --resume {id}")
+        );
+        assert_eq!(
+            format_resume_command(Path::new("/srv/it's"), id, home),
+            format!("cd '/srv/it'\\''s' && claude --resume {id}")
+        );
+        assert_eq!(
+            format_resume_command(Path::new("/opt/app"), id, None),
+            format!("cd /opt/app && claude --resume {id}")
+        );
+    }
+
     use super::{
         build_discovery_catalog, header_line_area, history_depth_controls_area,
         history_style_controls_area, project_list_label, sort_catalog_by_display_path,

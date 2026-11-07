@@ -19,6 +19,8 @@ use tokio::sync::{mpsc, watch};
 pub struct Config {
     pub live_limits_mode: LiveLimitsMode,
     pub pricing: crate::pricing::PriceTable,
+    /// Opens resumed sessions in a new terminal window, when available.
+    pub resume_launcher: Option<crate::launch::Launcher>,
     pub claudemon_home: std::path::PathBuf,
     pub claude_dir: std::path::PathBuf,
     pub read_sessions_dir: std::path::PathBuf,
@@ -491,7 +493,6 @@ pub(crate) struct AppState {
     pub(crate) live_limits_mode: LiveLimitsMode,
     /// Transient notice on the APISTAT screen (for example after a copy).
     pub(crate) api_stat_notice: Option<String>,
-    /// Text to place on the terminal clipboard after the next draw.
     pub(crate) clipboard_request: Option<String>,
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
@@ -500,6 +501,10 @@ const STATE_STORE_SCHEMA_VERSION: u32 = 4;
 const STATE_STORE_FILE_NAME: &str = "state.json";
 const STATE_SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 const IDLE_UI_TICK: Duration = Duration::from_secs(1);
+const INPUT_PAUSE_POLL: Duration = Duration::from_millis(50);
+/// Longer than the input reader's poll timeout, so an in-flight poll ends
+/// before the child process takes over the terminal.
+const INPUT_PAUSE_SETTLE: Duration = Duration::from_millis(200);
 pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
 pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
 pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
@@ -649,6 +654,9 @@ async fn run_inner(
     let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
     let (catalog_refresh_tx, catalog_refresh_rx) = mpsc::channel::<()>(1);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Paused while a resumed Claude Code session owns the terminal, so the
+    // reader does not steal its keystrokes.
+    let input_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let restored_ui_state = load_persisted_ui_state_with_history_depth(
         &config.claudemon_home,
         config.workspace_path.as_deref(),
@@ -668,6 +676,16 @@ async fn run_inner(
         sessions_dir: config.read_sessions_dir.clone(),
     };
     let mut read_browser = read::build_browser(&read_config)?;
+    read_browser.set_launch_support(
+        config
+            .resume_launcher
+            .as_ref()
+            .is_some_and(|launcher| launcher.supports(crate::launch::Placement::Window)),
+        config
+            .resume_launcher
+            .as_ref()
+            .is_some_and(|launcher| launcher.supports(crate::launch::Placement::Tab)),
+    );
     read_browser.restore_project_state(
         restored_ui_state.history_project_view_mode,
         restored_ui_state.history_deep_depth,
@@ -937,11 +955,16 @@ async fn run_inner(
     {
         let input_tx = input_tx.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let input_paused = input_paused.clone();
         tokio::spawn(async move {
             let shutdown_rx = shutdown_rx;
             loop {
                 if *shutdown_rx.borrow() {
                     break;
+                }
+                if input_paused.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::time::sleep(INPUT_PAUSE_POLL).await;
+                    continue;
                 }
                 let event = tokio::task::spawn_blocking(|| {
                     let timeout = Duration::from_millis(100);
@@ -1049,6 +1072,48 @@ async fn run_inner(
                             let _ = shutdown_tx.send(true);
                             break;
                         }
+                    }
+                    match state.read_browser.take_pending_action() {
+                        Some(read::tui::SessionAction::Copy(command)) => {
+                            state
+                                .read_browser
+                                .set_resume_notice("Copied to the clipboard.".to_string());
+                            state.clipboard_request = Some(command);
+                            dirty = true;
+                        }
+                        Some(read::tui::SessionAction::ResumeExternal {
+                            cwd,
+                            session_id,
+                            placement,
+                        }) => {
+                            let notice = match config.resume_launcher.clone() {
+                                Some(launcher) => {
+                                    let label = launcher.label(placement);
+                                    let opened = tokio::task::spawn_blocking(move || {
+                                        launcher.open(&cwd, &session_id, placement)
+                                    })
+                                    .await;
+                                    match opened {
+                                        Ok(Ok(())) => format!("Opened in {label}."),
+                                        Ok(Err(error)) => format!("Could not open {label}: {error}"),
+                                        Err(error) => format!("Could not open {label}: {error}"),
+                                    }
+                                }
+                                None => "No terminal launcher; press i to resume here.".to_string(),
+                            };
+                            state.read_browser.set_resume_notice(notice);
+                            dirty = true;
+                        }
+                        Some(read::tui::SessionAction::ResumeHere { cwd, session_id }) => {
+                            let notice =
+                                resume_session(terminal, &cwd, &session_id, &input_paused).await;
+                            state.read_browser.set_resume_notice(notice);
+                            state.read_browser.invalidate_selected_session_detail();
+                            state.mouse_position = None;
+                            let _ = usage_refresh_tx.try_send(());
+                            dirty = true;
+                        }
+                        None => {}
                     }
                 }
             }
@@ -2080,6 +2145,52 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             state.read_browser.set_catalog_error(error);
             true
         }
+    }
+}
+
+/// Runs `claude --resume <id>` in the session's launch directory with the
+/// terminal handed over to it, then restores the TUI. Returns a notice for
+/// the history screen.
+async fn resume_session(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    cwd: &Path,
+    session_id: &str,
+    input_paused: &std::sync::atomic::AtomicBool,
+) -> String {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
+    input_paused.store(true, AtomicOrdering::Release);
+    tokio::time::sleep(INPUT_PAUSE_SETTLE).await;
+    if let Err(error) = crate::ui::suspend_terminal(terminal) {
+        input_paused.store(false, AtomicOrdering::Release);
+        return format!("Unable to release the terminal: {error}");
+    }
+    println!(
+        "claudemon: resuming {session_id} in {} (exit Claude Code to return)",
+        cwd.display()
+    );
+    let status = tokio::process::Command::new("claude")
+        .arg("--resume")
+        .arg(session_id)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .await;
+    let restored = crate::ui::resume_terminal(terminal);
+    input_paused.store(false, AtomicOrdering::Release);
+    let notice = match status {
+        Ok(status) if status.success() => "Returned from Claude Code.".to_string(),
+        Ok(status) => format!("Claude Code exited with {status}."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            "`claude` was not found on PATH; copy the command with y instead.".to_string()
+        }
+        Err(error) => format!("Unable to start Claude Code: {error}"),
+    };
+    match restored {
+        Ok(()) => notice,
+        Err(error) => format!("{notice} Terminal restore failed: {error}"),
     }
 }
 
