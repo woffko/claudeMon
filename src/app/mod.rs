@@ -1,6 +1,7 @@
 use crate::limits::AccountRateLimits;
 use crate::locale::{DisplayFormatter, DisplayStyle, SystemLocale};
 use crate::read;
+use crate::recent::{Agent, RecentSession};
 use crate::usage::{ChartRange, LocalUsageSnapshot, UsageMetric, UsageZone};
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
@@ -136,6 +137,66 @@ impl ModelsRange {
             "all" => Some(Self::AllTime),
             "7d" => Some(Self::Last7Days),
             "30d" => Some(Self::Last30Days),
+            _ => None,
+        }
+    }
+}
+
+/// Period of the RECENT screen: sessions last active within it are listed,
+/// running sessions always.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecentRange {
+    Day,
+    Week,
+    Month,
+}
+
+impl RecentRange {
+    fn cycled(self) -> Self {
+        match self {
+            Self::Day => Self::Week,
+            Self::Week => Self::Month,
+            Self::Month => Self::Day,
+        }
+    }
+
+    pub(crate) fn secs(self) -> i64 {
+        match self {
+            Self::Day => 86_400,
+            Self::Week => 7 * 86_400,
+            Self::Month => 30 * 86_400,
+        }
+    }
+
+    pub(crate) fn pill_label(self) -> &'static str {
+        match self {
+            Self::Day => "DAY",
+            Self::Week => "WEEK",
+            Self::Month => "MONTH",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Day => "last 24 hours",
+            Self::Week => "last 7 days",
+            Self::Month => "last 30 days",
+        }
+    }
+
+    fn store_value(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+        }
+    }
+
+    fn from_store(value: &str) -> Option<Self> {
+        match value {
+            "day" => Some(Self::Day),
+            "week" => Some(Self::Week),
+            "month" => Some(Self::Month),
             _ => None,
         }
     }
@@ -318,6 +379,7 @@ enum AppEvent {
         from_cache: bool,
     },
     HistoryCatalogFailed(String),
+    RecentUpdated(Vec<RecentSession>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +389,7 @@ pub(crate) enum ActiveScreen {
     ApiStat,
     Cost,
     Read,
+    Recent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +413,11 @@ pub(crate) enum UiClickAction {
     SetCostRange(ModelsRange),
     CopyModelsTable,
     OpenUsagePage,
+    SetRecentRange(RecentRange),
+    /// Row of the RECENT list (index into the visible sessions).
+    SelectRecent(usize),
+    LaunchRecent(usize, crate::launch::Placement),
+    CopyRecentCommand,
     ScrollUsageOlder,
     ScrollUsageNewer,
     SetUsageScrollOffset(usize),
@@ -436,8 +504,32 @@ fn next_active_screen(screen: ActiveScreen) -> ActiveScreen {
         ActiveScreen::ApiStat => ActiveScreen::Cost,
         ActiveScreen::Cost => ActiveScreen::Activity,
         ActiveScreen::Activity => ActiveScreen::Read,
-        ActiveScreen::Read => ActiveScreen::Usage,
+        ActiveScreen::Read => ActiveScreen::Recent,
+        ActiveScreen::Recent => ActiveScreen::Usage,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecentCommand {
+    Up,
+    Down,
+    PageUp,
+    PageDown,
+    First,
+    Last,
+    Launch(crate::launch::Placement),
+    Copy,
+    CycleRange,
+    Refresh,
+    ToggleHelp,
+}
+
+/// A RECENT session to open in a new terminal window or tab.
+#[derive(Debug, Clone)]
+pub(crate) struct RecentLaunchRequest {
+    cwd: PathBuf,
+    resume: crate::launch::ResumeCommand,
+    placement: crate::launch::Placement,
 }
 
 #[derive(Debug)]
@@ -497,6 +589,20 @@ pub(crate) struct AppState {
     pub(crate) api_stat_notice: Option<String>,
     /// Web page to open in the browser after this input event.
     pub(crate) open_url_request: Option<&'static str>,
+    pub(crate) recent_range: RecentRange,
+    pub(crate) recent_sessions: Vec<RecentSession>,
+    pub(crate) recent_scanned_at: Option<i64>,
+    pub(crate) recent_selected: Option<(Agent, String)>,
+    /// First visible row; kept by the renderer.
+    pub(crate) recent_scroll: usize,
+    /// Rows that fit in the list; set by the renderer.
+    pub(crate) recent_page_rows: usize,
+    pub(crate) recent_notice: Option<String>,
+    recent_last_click: Option<(usize, Instant)>,
+    pub(crate) recent_launch_request: Option<RecentLaunchRequest>,
+    /// Whether the terminal launcher can open a window / a tab.
+    pub(crate) recent_launch_support: (bool, bool),
+    /// Text to place on the terminal clipboard after the next draw.
     pub(crate) clipboard_request: Option<String>,
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
@@ -512,6 +618,11 @@ const INPUT_PAUSE_SETTLE: Duration = Duration::from_millis(200);
 pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
 pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
 pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
+/// How often the RECENT screen re-reads session files while it is shown.
+/// Only local files and /proc are read; no tokens are spent.
+const RECENT_REFRESH: Duration = Duration::from_secs(15);
+/// Two clicks on the same RECENT row within this time open the session.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// claude.ai page with the usage limits and the limit-reset button.
 const CLAUDE_USAGE_URL: &str = "https://claude.ai/settings/usage";
 
@@ -524,6 +635,7 @@ struct PersistedUiState {
     api_stat_view: ApiStatView,
     models_range: ModelsRange,
     cost_range: ModelsRange,
+    recent_range: RecentRange,
     activity_project_limit: usize,
     workspace_path: Option<PathBuf>,
     no_sessions_confirm_dismissed: bool,
@@ -548,6 +660,7 @@ impl PersistedUiState {
             api_stat_view: ApiStatView::Overview,
             models_range: ModelsRange::Last30Days,
             cost_range: ModelsRange::Last30Days,
+            recent_range: RecentRange::Week,
             activity_project_limit: DEFAULT_ACTIVITY_PROJECT_LIMIT,
             workspace_path,
             no_sessions_confirm_dismissed: false,
@@ -572,6 +685,7 @@ impl PersistedUiState {
             api_stat_view: state.api_stat_view,
             models_range: state.models_range,
             cost_range: state.cost_range,
+            recent_range: state.recent_range,
             activity_project_limit: state.activity_project_limit,
             workspace_path: state.workspace_path.clone(),
             no_sessions_confirm_dismissed: state.no_sessions_confirm_dismissed,
@@ -619,6 +733,8 @@ struct StoredGlobalState {
     api_stat_view: Option<String>,
     models_range: Option<String>,
     cost_range: Option<String>,
+    #[serde(default)]
+    recent_range: Option<String>,
     activity_project_limit: Option<usize>,
     display_style: Option<String>,
     accent_theme: Option<String>,
@@ -659,6 +775,9 @@ async fn run_inner(
     let (usage_refresh_tx, usage_refresh_rx) = mpsc::channel::<()>(1);
     let (limits_refresh_tx, limits_refresh_rx) = mpsc::channel::<()>(1);
     let (catalog_refresh_tx, catalog_refresh_rx) = mpsc::channel::<()>(1);
+    let (recent_refresh_tx, recent_refresh_rx) = mpsc::channel::<()>(1);
+    // The RECENT worker scans only while that screen is shown.
+    let recent_visible = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // Paused while a resumed Claude Code session owns the terminal, so the
     // reader does not steal its keystrokes.
@@ -957,6 +1076,55 @@ async fn run_inner(
         });
     }
 
+    // Spawn RECENT worker: re-reads agent session files every
+    // RECENT_REFRESH while the screen is shown, and on request.
+    {
+        let evt_tx = evt_tx.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        let mut recent_refresh_rx = recent_refresh_rx;
+        let recent_visible = recent_visible.clone();
+        let claude_dir = config.claude_dir.clone();
+        tokio::spawn(async move {
+            let mut scanner = Some(crate::recent::Scanner::new(claude_dir.clone()));
+            let mut interval = tokio::time::interval(RECENT_REFRESH);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = interval.tick() => {
+                        if !recent_visible.load(std::sync::atomic::Ordering::Acquire) {
+                            continue;
+                        }
+                    }
+                    recv = recent_refresh_rx.recv() => {
+                        if recv.is_none() {
+                            break;
+                        }
+                    }
+                }
+                let mut current = scanner
+                    .take()
+                    .unwrap_or_else(|| crate::recent::Scanner::new(claude_dir.clone()));
+                let scanned = tokio::task::spawn_blocking(move || {
+                    let sessions = current.scan(crate::limits::unix_now());
+                    (current, sessions)
+                })
+                .await;
+                let Ok((current, sessions)) = scanned else {
+                    continue;
+                };
+                scanner = Some(current);
+                if evt_tx
+                    .send(AppEvent::RecentUpdated(sessions))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
     // Spawn input reader.
     {
         let input_tx = input_tx.clone();
@@ -1048,6 +1216,25 @@ async fn run_inner(
         live_limits_mode: config.live_limits_mode,
         api_stat_notice: None,
         open_url_request: None,
+        recent_range: restored_ui_state.recent_range,
+        recent_sessions: Vec::new(),
+        recent_scanned_at: None,
+        recent_selected: None,
+        recent_scroll: 0,
+        recent_page_rows: 0,
+        recent_notice: None,
+        recent_last_click: None,
+        recent_launch_request: None,
+        recent_launch_support: (
+            config
+                .resume_launcher
+                .as_ref()
+                .is_some_and(|launcher| launcher.supports(crate::launch::Placement::Window)),
+            config
+                .resume_launcher
+                .as_ref()
+                .is_some_and(|launcher| launcher.supports(crate::launch::Placement::Tab)),
+        ),
         clipboard_request: None,
         read_browser,
     };
@@ -1065,12 +1252,14 @@ async fn run_inner(
         tokio::select! {
             input = input_rx.recv() => {
                 if let Some(input) = input {
+                    let screen_before = state.active_screen;
                     match handle_input_event(
                         &mut state,
                         input,
                         &usage_refresh_tx,
                         &limits_refresh_tx,
                         &catalog_refresh_tx,
+                        &recent_refresh_tx,
                     )? {
                         InputOutcome::Continue(should_redraw) => {
                             dirty |= should_redraw;
@@ -1093,20 +1282,19 @@ async fn run_inner(
                             session_id,
                             placement,
                         }) => {
-                            let notice = match config.resume_launcher.clone() {
-                                Some(launcher) => {
-                                    let label = launcher.label(placement);
-                                    let opened = tokio::task::spawn_blocking(move || {
-                                        launcher.open(&cwd, &session_id, placement)
-                                    })
-                                    .await;
-                                    match opened {
-                                        Ok(Ok(())) => format!("Opened in {label}."),
-                                        Ok(Err(error)) => format!("Could not open {label}: {error}"),
-                                        Err(error) => format!("Could not open {label}: {error}"),
-                                    }
-                                }
-                                None => "No terminal launcher; press i to resume here.".to_string(),
+                            let notice = match crate::launch::ResumeCommand::claude(&session_id, None)
+                            {
+                                Some(resume) => open_resumed_session(
+                                    config.resume_launcher.clone(),
+                                    cwd,
+                                    resume,
+                                    placement,
+                                )
+                                .await
+                                .unwrap_or_else(|| {
+                                    "No terminal launcher; press i to resume here.".to_string()
+                                }),
+                                None => "This session id cannot be resumed.".to_string(),
                             };
                             state.read_browser.set_resume_notice(notice);
                             dirty = true;
@@ -1133,6 +1321,25 @@ async fn run_inner(
                             Err(error) => format!("Could not open {url}: {error}"),
                         });
                         dirty = true;
+                    }
+                    if let Some(request) = state.recent_launch_request.take() {
+                        let notice = open_resumed_session(
+                            config.resume_launcher.clone(),
+                            request.cwd,
+                            request.resume,
+                            request.placement,
+                        )
+                        .await
+                        .unwrap_or_else(|| {
+                            "No terminal launcher; press y to copy the command.".to_string()
+                        });
+                        state.recent_notice = Some(notice);
+                        dirty = true;
+                    }
+                    let recent_shown = state.active_screen == ActiveScreen::Recent;
+                    recent_visible.store(recent_shown, std::sync::atomic::Ordering::Release);
+                    if recent_shown && screen_before != ActiveScreen::Recent {
+                        let _ = recent_refresh_tx.try_send(());
                     }
                 }
             }
@@ -1228,6 +1435,7 @@ fn handle_input_event(
     usage_refresh_tx: &mpsc::Sender<()>,
     limits_refresh_tx: &mpsc::Sender<()>,
     catalog_refresh_tx: &mpsc::Sender<()>,
+    recent_refresh_tx: &mpsc::Sender<()>,
 ) -> Result<InputOutcome> {
     if state.history_catalog_scan_prompt {
         return match event {
@@ -1422,6 +1630,7 @@ fn handle_input_event(
                     };
                     handle_activity_command(state, command, usage_refresh_tx, limits_refresh_tx)
                 }
+                ActiveScreen::Recent => move_recent_selection(state, if older { -1 } else { 1 }),
                 _ => false,
             };
             if changed {
@@ -1434,6 +1643,18 @@ fn handle_input_event(
         ) {
             if let Some(action) = ui_click_action_at(&state.ui_hit_targets, mouse.column, mouse.row)
             {
+                // Session rows react to presses only, so a drag does not
+                // count as a second click.
+                if matches!(mouse.kind, MouseEventKind::Drag(_))
+                    && matches!(
+                        action,
+                        UiClickAction::SelectRecent(_)
+                            | UiClickAction::LaunchRecent(..)
+                            | UiClickAction::CopyRecentCommand
+                    )
+                {
+                    return Ok(InputOutcome::Continue(false));
+                }
                 if action == UiClickAction::ConfirmQuit
                     || (action == UiClickAction::PromptQuit && state.skip_quit_confirmation)
                 {
@@ -1530,6 +1751,217 @@ fn handle_input_event(
             &mut state.read_browser,
             event,
         )?)),
+        ActiveScreen::Recent => {
+            let Some(command) = map_event_to_recent_cmd(event) else {
+                return Ok(InputOutcome::Continue(false));
+            };
+            Ok(InputOutcome::Continue(handle_recent_command(
+                state,
+                command,
+                recent_refresh_tx,
+            )))
+        }
+    }
+}
+
+fn map_event_to_recent_cmd(event: Event) -> Option<RecentCommand> {
+    use crate::launch::Placement;
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => Some(RecentCommand::Up),
+            KeyCode::Down | KeyCode::Char('j') => Some(RecentCommand::Down),
+            KeyCode::PageUp => Some(RecentCommand::PageUp),
+            KeyCode::PageDown => Some(RecentCommand::PageDown),
+            KeyCode::Home => Some(RecentCommand::First),
+            KeyCode::End => Some(RecentCommand::Last),
+            KeyCode::Enter => Some(RecentCommand::Launch(Placement::Window)),
+            KeyCode::Char('t') | KeyCode::Char('T') => Some(RecentCommand::Launch(Placement::Tab)),
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(RecentCommand::Copy),
+            KeyCode::Char('d') | KeyCode::Char('D') => Some(RecentCommand::CycleRange),
+            KeyCode::Char('r') | KeyCode::F(5) => Some(RecentCommand::Refresh),
+            KeyCode::Char('?') => Some(RecentCommand::ToggleHelp),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn handle_recent_command(
+    state: &mut AppState,
+    cmd: RecentCommand,
+    recent_refresh_tx: &mpsc::Sender<()>,
+) -> bool {
+    let page = state.recent_page_rows.max(1) as isize;
+    match cmd {
+        RecentCommand::Up => move_recent_selection(state, -1),
+        RecentCommand::Down => move_recent_selection(state, 1),
+        RecentCommand::PageUp => move_recent_selection(state, -page),
+        RecentCommand::PageDown => move_recent_selection(state, page),
+        RecentCommand::First => move_recent_selection(state, isize::MIN / 2),
+        RecentCommand::Last => move_recent_selection(state, isize::MAX / 2),
+        RecentCommand::Launch(placement) => {
+            request_recent_launch(state, None, placement);
+            true
+        }
+        RecentCommand::Copy => {
+            copy_recent_command(state);
+            true
+        }
+        RecentCommand::CycleRange => {
+            state.recent_range = state.recent_range.cycled();
+            true
+        }
+        RecentCommand::Refresh => {
+            state.recent_notice = None;
+            let _ = recent_refresh_tx.try_send(());
+            true
+        }
+        RecentCommand::ToggleHelp => {
+            state.show_help = !state.show_help;
+            true
+        }
+    }
+}
+
+impl AppState {
+    /// RECENT sessions in the selected range (running ones always), in
+    /// display order.
+    pub(crate) fn visible_recent_sessions(&self, now: i64) -> Vec<&RecentSession> {
+        let since = now - self.recent_range.secs();
+        self.recent_sessions
+            .iter()
+            .filter(|session| session.is_running() || session.last_active >= since)
+            .collect()
+    }
+
+    /// Position of the selected session in `visible`, else the first row.
+    pub(crate) fn selected_recent_position(&self, visible: &[&RecentSession]) -> usize {
+        self.recent_selected
+            .as_ref()
+            .and_then(|(agent, id)| {
+                visible
+                    .iter()
+                    .position(|session| session.agent == *agent && session.session_id == *id)
+            })
+            .unwrap_or(0)
+    }
+
+    fn select_recent_at(&mut self, position: usize) -> bool {
+        let now = crate::limits::unix_now();
+        let key = {
+            let visible = self.visible_recent_sessions(now);
+            let Some(session) = visible.get(position) else {
+                return false;
+            };
+            (session.agent, session.session_id.clone())
+        };
+        let changed = self.recent_selected.as_ref() != Some(&key);
+        self.recent_selected = Some(key);
+        changed
+    }
+}
+
+fn move_recent_selection(state: &mut AppState, delta: isize) -> bool {
+    let now = crate::limits::unix_now();
+    let (count, current) = {
+        let visible = state.visible_recent_sessions(now);
+        (visible.len(), state.selected_recent_position(&visible))
+    };
+    if count == 0 {
+        return false;
+    }
+    let next = (current as isize)
+        .saturating_add(delta)
+        .clamp(0, count as isize - 1) as usize;
+    state.recent_notice = None;
+    state.select_recent_at(next) || next != current
+}
+
+/// Queues the selected (or `position`) RECENT session to open in a new
+/// terminal, or explains why it cannot.
+fn request_recent_launch(
+    state: &mut AppState,
+    position: Option<usize>,
+    placement: crate::launch::Placement,
+) {
+    use crate::launch::Placement;
+    use crate::recent::SessionState;
+    let now = crate::limits::unix_now();
+    if let Some(position) = position {
+        state.select_recent_at(position);
+    }
+    let supported = match placement {
+        Placement::Window => state.recent_launch_support.0,
+        Placement::Tab => state.recent_launch_support.1,
+    };
+    let outcome = {
+        let visible = state.visible_recent_sessions(now);
+        let position = state.selected_recent_position(&visible);
+        match visible.get(position) {
+            None => Err("No session selected.".to_string()),
+            Some(session) => match (&session.state, &session.resume, &session.cwd) {
+                (SessionState::Running(process), _, _) => Err(format!(
+                    "Already running: pid {}{}.",
+                    process.pid,
+                    process
+                        .tty
+                        .as_deref()
+                        .map(|tty| format!(" on {tty}"))
+                        .unwrap_or_default()
+                )),
+                (_, None, _) => Err("This session cannot be resumed from here.".to_string()),
+                (_, _, None) => Err("The session directory is unknown.".to_string()),
+                (_, Some(_), Some(cwd)) if !cwd.is_dir() => {
+                    Err(format!("Directory not found: {}", cwd.display()))
+                }
+                (_, Some(_), Some(_)) if !supported => Err(match placement {
+                    Placement::Window => {
+                        "No terminal launcher for a new window; press y to copy the command."
+                            .to_string()
+                    }
+                    Placement::Tab => {
+                        "No terminal launcher for a new tab; press y to copy the command."
+                            .to_string()
+                    }
+                }),
+                (_, Some(resume), Some(cwd)) => Ok(RecentLaunchRequest {
+                    cwd: cwd.clone(),
+                    resume: resume.clone(),
+                    placement,
+                }),
+            },
+        }
+    };
+    match outcome {
+        Ok(request) => {
+            state.recent_notice = Some(format!("Opening {}...", request.resume.text()));
+            state.recent_launch_request = Some(request);
+        }
+        Err(notice) => state.recent_notice = Some(notice),
+    }
+}
+
+/// Queues `cd <dir> && <resume command>` of the selected session for the
+/// terminal clipboard.
+fn copy_recent_command(state: &mut AppState) {
+    let now = crate::limits::unix_now();
+    let command = {
+        let visible = state.visible_recent_sessions(now);
+        let position = state.selected_recent_position(&visible);
+        visible.get(position).and_then(|session| {
+            let resume = session.resume.as_ref()?.text();
+            Some(match session.cwd.as_deref() {
+                Some(cwd) => crate::read::tui::cd_command(cwd, &resume),
+                None => resume,
+            })
+        })
+    };
+    match command {
+        Some(command) => {
+            state.recent_notice = Some("Copied the resume command to the clipboard.".to_string());
+            state.clipboard_request = Some(command);
+        }
+        None => state.recent_notice = Some("Nothing to copy.".to_string()),
     }
 }
 
@@ -1663,6 +2095,34 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
         UiClickAction::OpenUsagePage => {
             state.api_stat_notice = None;
             state.open_url_request = Some(CLAUDE_USAGE_URL);
+            true
+        }
+        UiClickAction::SetRecentRange(range) => {
+            let changed = state.recent_range != range;
+            state.recent_range = range;
+            changed
+        }
+        UiClickAction::SelectRecent(position) => {
+            let now = Instant::now();
+            let double = state.recent_last_click.is_some_and(|(last, at)| {
+                last == position && now.duration_since(at) <= DOUBLE_CLICK
+            });
+            state.recent_notice = None;
+            state.select_recent_at(position);
+            if double {
+                state.recent_last_click = None;
+                request_recent_launch(state, Some(position), crate::launch::Placement::Window);
+            } else {
+                state.recent_last_click = Some((position, now));
+            }
+            true
+        }
+        UiClickAction::LaunchRecent(position, placement) => {
+            request_recent_launch(state, Some(position), placement);
+            true
+        }
+        UiClickAction::CopyRecentCommand => {
+            copy_recent_command(state);
             true
         }
         UiClickAction::ScrollUsageOlder => scroll_usage_periods(state, 1, true),
@@ -2176,6 +2636,11 @@ fn handle_app_event(state: &mut AppState, evt: AppEvent) -> bool {
             state.read_browser.set_catalog_error(error);
             true
         }
+        AppEvent::RecentUpdated(sessions) => {
+            state.recent_sessions = sessions;
+            state.recent_scanned_at = Some(crate::limits::unix_now());
+            true
+        }
     }
 }
 
@@ -2237,6 +2702,24 @@ fn limits_refresh_interval(mode: LiveLimitsMode, configured_secs: u64) -> Durati
         }
         LiveLimitsMode::Off => Duration::from_secs(configured_secs.max(1)),
     }
+}
+
+/// Opens a resumed session with the terminal launcher and returns the
+/// notice to show, or `None` when no launcher is available.
+async fn open_resumed_session(
+    launcher: Option<crate::launch::Launcher>,
+    cwd: PathBuf,
+    resume: crate::launch::ResumeCommand,
+    placement: crate::launch::Placement,
+) -> Option<String> {
+    let launcher = launcher?;
+    let label = launcher.label(placement);
+    let opened = tokio::task::spawn_blocking(move || launcher.open(&cwd, &resume, placement)).await;
+    Some(match opened {
+        Ok(Ok(())) => format!("Opened in {label}."),
+        Ok(Err(error)) => format!("Could not open {label}: {error}"),
+        Err(error) => format!("Could not open {label}: {error}"),
+    })
 }
 
 /// Reads the configured limit source. Blocking.
@@ -2337,6 +2820,14 @@ fn load_persisted_ui_state_with_history_depth(
     {
         state.cost_range = range;
     }
+    if let Some(range) = store
+        .global
+        .recent_range
+        .as_deref()
+        .and_then(RecentRange::from_store)
+    {
+        state.recent_range = range;
+    }
     if let Some(limit) = store.global.activity_project_limit {
         state.activity_project_limit =
             limit.clamp(MIN_ACTIVITY_PROJECT_LIMIT, MAX_ACTIVITY_PROJECT_LIMIT);
@@ -2409,6 +2900,7 @@ fn save_persisted_ui_state(claudemon_home: &Path, state: &PersistedUiState) -> R
     store.global.api_stat_view = Some(state.api_stat_view.store_value().to_string());
     store.global.models_range = Some(state.models_range.store_value().to_string());
     store.global.cost_range = Some(state.cost_range.store_value().to_string());
+    store.global.recent_range = Some(state.recent_range.store_value().to_string());
     store.global.activity_project_limit = Some(
         state
             .activity_project_limit
@@ -2772,7 +3264,11 @@ mod tests {
             next_active_screen(ActiveScreen::Activity),
             ActiveScreen::Read
         );
-        assert_eq!(next_active_screen(ActiveScreen::Read), ActiveScreen::Usage);
+        assert_eq!(next_active_screen(ActiveScreen::Read), ActiveScreen::Recent);
+        assert_eq!(
+            next_active_screen(ActiveScreen::Recent),
+            ActiveScreen::Usage
+        );
     }
 
     #[test]

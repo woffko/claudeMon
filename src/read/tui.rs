@@ -484,11 +484,22 @@ fn format_resume_command(
     session_id: &str,
     home: Option<&std::path::Path>,
 ) -> String {
+    format_cd_command(cwd, &format!("claude --resume {session_id}"), home)
+}
+
+/// `cd <cwd> && <command>` with the home directory shortened to `~`.
+pub(crate) fn cd_command(cwd: &std::path::Path, command: &str) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    format_cd_command(cwd, command, home.as_deref())
+}
+
+fn format_cd_command(
+    cwd: &std::path::Path,
+    command: &str,
+    home: Option<&std::path::Path>,
+) -> String {
     if cfg!(windows) {
-        return format!(
-            "cd /d \"{}\" && claude --resume {session_id}",
-            cwd.display()
-        );
+        return format!("cd /d \"{}\" && {command}", cwd.display());
     }
     let shell_safe = |text: &str| {
         !text.is_empty()
@@ -514,7 +525,7 @@ fn format_resume_command(
             }
         }
     };
-    format!("cd {target} && claude --resume {session_id}")
+    format!("cd {target} && {command}")
 }
 
 #[derive(Default)]

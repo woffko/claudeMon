@@ -118,3 +118,52 @@ reads only this key and `oauthAccount.accountUuid` (a cache left by another
 account is ignored) and takes the per-model limits, extra usage, and
 by-surface breakdown from it; the newer of S5 and S6 supplies the 5-hour and
 weekly windows.
+
+## S7. Agent sessions (RECENT screen)
+
+All read-only and local; checked 2026-11-07 with Claude Code 2.1.319,
+Codex 0.167.0, opencode 1.18.35, and agy 1.5.2.
+
+**Claude Code.** Transcripts `<claude-dir>/projects/<project>/<id>.jsonl`:
+the first lines carry `sessionId`, `cwd`, `timestamp`, and `entrypoint`
+(`cli` interactive, `sdk-cli` for `claude -p`, which is skipped); title
+records (`custom-title`, `ai-title`, `summary`) can appear anywhere, and
+transcripts can be hundreds of megabytes, so only the first 256 KiB and
+the last 1 MiB are read. Running processes register in
+`<claude-dir>/sessions/<pid>.json`: `pid`, `sessionId`, `cwd`, `startedAt`
+and `updatedAt` (Unix ms), `procStart` (field 22 of `/proc/<pid>/stat`),
+`name`, `nameSource` (`user` or `derived`), `status` (`busy`, `idle`,
+`waiting`, `shell`), `waitingFor`. The files stay after the process exits;
+a session is running only while the PID is alive with that `procStart`.
+The `<pid>.<hash>.key` files next to them hold peer tokens and are never
+read. Resume: `claude --resume <id>`, plus `--name <name>` for a user name.
+
+**Codex.** `$CODEX_HOME/state_<n>.sqlite` (default `~/.codex`), table
+`threads`: `id`, `cwd`, `name`, `title`, `created_at_ms`, `updated_at_ms`,
+`source` (`cli`, `vscode`, `exec`, or JSON for subagent threads),
+`thread_source` (`user`, `subagent`, `guardian_review`), `archived`.
+Listed: `source` `cli`/`vscode`, `thread_source` `user` or null, not
+archived. No registry of running sessions: a `codex` process (excluding
+`app-server`, `exec`, `mcp`, ...) is matched by `resume <id>` in its
+command line, else by its working directory. Resume: `codex resume <id>`.
+
+**opencode.** `$XDG_DATA_HOME/opencode/opencode.db` (default
+`~/.local/share`), table `session`: `id` (`ses_...`), `parent_id` (set for
+subagents), `directory`, `title`, `time_created`, `time_updated`,
+`time_archived` (Unix ms). Running: an `opencode` process (excluding `run`,
+`serve`, `acp`, `web`, ...) matched by `-s <id>`, else by its working
+directory. Resume: `opencode -s <id>`.
+
+**Antigravity (`agy`).** `~/.gemini/antigravity-cli/conversation_summaries.db`,
+table `conversation_summaries`: `conversation_id`, `title` (often empty),
+`preview`, `last_modified_time` (`YYYY-MM-DD HH:MM:SS.f+00:00`),
+`workspace_uris` (JSON array of `file://` URIs), `status`
+(`CASCADE_RUN_STATUS_*`), `nesting_depth` (0 for top-level). Conversations
+whose workspace is in the temporary directory (scripted runs) are skipped.
+A running agy holds an exclusive `flock` on
+`presence/<conversation-id>.lock`; the holder is read from `/proc/locks`
+by inode, so claudemon takes no lock. Resume: `agy --conversation <id>`.
+
+Matching by working directory (Codex, opencode) picks the session in that
+directory that was active most recently since the process started; a
+process that has not sent a message yet matches nothing.

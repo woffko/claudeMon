@@ -55,3 +55,8 @@ All notable changes to this project are documented in this file.
   Terminal.app, or `resume_terminal_command` / `resume_terminal_tab_command`
   from config.json) while claudemon stays open; `i` resumes it in the
   current terminal; `y` copies the command.
+- RECENT screen: Claude Code, Codex, opencode, and Antigravity (`agy`)
+  sessions used in the last day, week, or month, with running status, PID,
+  and terminal. A stopped session resumes in a new terminal tab (RUN, `t`)
+  or window (Enter) with the agent's own resume command; the list refreshes every 15 seconds
+  while shown.

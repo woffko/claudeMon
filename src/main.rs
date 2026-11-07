@@ -4,6 +4,7 @@ mod limits;
 mod locale;
 mod pricing;
 mod read;
+mod recent;
 mod storage;
 mod ui;
 mod usage;

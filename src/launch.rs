@@ -1,5 +1,6 @@
-//! Opening a resumed Claude Code session in a new terminal window or tab,
-//! so the claudemon TUI stays open, and opening web pages in the browser.
+//! Opening a resumed agent session (Claude Code, Codex, ...) in a new
+//! terminal window or tab, so the claudemon TUI stays open, and opening web
+//! pages in the browser.
 
 use anyhow::{Context, Result};
 use std::io::Read;
@@ -15,6 +16,57 @@ const LAUNCH_WAIT: Duration = Duration::from_secs(5);
 pub enum Placement {
     Window,
     Tab,
+}
+
+/// The command that resumes one agent session, run in the session's
+/// directory. Every word is shell-safe, so it can be joined with spaces into
+/// a shell, `cmd`, or Windows Terminal command line without quoting (and
+/// without `;`, which Windows Terminal treats as a separator).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeCommand {
+    /// Agent name for window titles ("Claude", "Codex", ...).
+    pub label: &'static str,
+    pub session_id: String,
+    argv: Vec<String>,
+}
+
+impl ResumeCommand {
+    /// `None` when a word is not shell-safe.
+    pub fn new(label: &'static str, session_id: &str, argv: Vec<String>) -> Option<Self> {
+        (!argv.is_empty() && argv.iter().all(|word| is_shell_safe(word))).then(|| Self {
+            label,
+            session_id: session_id.to_string(),
+            argv,
+        })
+    }
+
+    /// `claude --resume <id>`, with `--name <name>` when the name is
+    /// shell-safe.
+    pub fn claude(session_id: &str, name: Option<&str>) -> Option<Self> {
+        let mut argv = vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            session_id.to_string(),
+        ];
+        if let Some(name) = name.filter(|name| is_shell_safe(name)) {
+            argv.extend(["--name".to_string(), name.to_string()]);
+        }
+        Self::new("Claude", session_id, argv)
+    }
+
+    /// The command line, for example `claude --resume <id>`.
+    pub fn text(&self) -> String {
+        self.argv.join(" ")
+    }
+}
+
+/// Letters, digits, and `._-:/=@+,%`: safe unquoted in sh, cmd, and
+/// Windows Terminal command lines.
+pub fn is_shell_safe(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "._-:/=@+,%".contains(ch))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,11 +151,11 @@ impl Launcher {
     fn command(
         &self,
         cwd: &Path,
-        session_id: &str,
+        resume: &ResumeCommand,
         placement: Placement,
     ) -> (PathBuf, Vec<String>) {
         let cwd_text = cwd.display().to_string();
-        let title = window_title(cwd);
+        let title = window_title(resume.label, cwd);
         // Windows Terminal: `-w new` opens a window, `-w 0` targets the most
         // recently used window (the one running claudemon) for a new tab.
         let wt_window = match placement {
@@ -119,7 +171,7 @@ impl Launcher {
                 .or(window.as_deref())
                 .or(tab.as_deref())
                 .unwrap_or_default();
-                let expanded = expand_template(template, cwd, session_id);
+                let expanded = expand_template(template, cwd, resume);
                 if cfg!(windows) {
                     (PathBuf::from("cmd"), vec!["/C".to_string(), expanded])
                 } else {
@@ -128,7 +180,7 @@ impl Launcher {
             }
             Self::Tmux => {
                 let shell = user_shell();
-                let script = shell_script(session_id, &shell);
+                let script = shell_script(resume, &shell);
                 (
                     PathBuf::from("tmux"),
                     vec![
@@ -143,7 +195,7 @@ impl Launcher {
             }
             Self::WindowsTerminalWsl { wt, distro } => {
                 let shell = user_shell();
-                let script = shell_script(session_id, &shell);
+                let script = shell_script(resume, &shell);
                 (
                     wt.clone(),
                     vec![
@@ -176,11 +228,11 @@ impl Launcher {
                     cwd_text,
                     "cmd".to_string(),
                     "/k".to_string(),
-                    format!("claude --resume {session_id}"),
+                    resume.text(),
                 ],
             ),
             Self::MacTerminal => {
-                let script = format!("cd {} && claude --resume {session_id}", sh_quote(&cwd_text));
+                let script = format!("cd {} && {}", sh_quote(&cwd_text), resume.text());
                 (
                     PathBuf::from("osascript"),
                     vec![
@@ -200,8 +252,8 @@ impl Launcher {
     /// Opens the session. Blocking for at most a few seconds: launchers
     /// that keep running (for example a custom terminal command) are left
     /// to run on their own.
-    pub fn open(&self, cwd: &Path, session_id: &str, placement: Placement) -> Result<()> {
-        let (program, args) = self.command(cwd, session_id, placement);
+    pub fn open(&self, cwd: &Path, resume: &ResumeCommand, placement: Placement) -> Result<()> {
+        let (program, args) = self.command(cwd, resume, placement);
         run_launcher(&program, &args, Some(cwd))
     }
 }
@@ -285,10 +337,10 @@ fn run_launcher(program: &Path, args: &[String], cwd: Option<&Path>) -> Result<(
     }
 }
 
-/// Runs Claude Code, then leaves an interactive shell in the project
+/// Runs the agent, then leaves an interactive shell in the project
 /// directory. Avoids `;`, which Windows Terminal treats as a separator.
-fn shell_script(session_id: &str, shell: &str) -> String {
-    format!("claude --resume {session_id} || true && exec {shell} -i")
+fn shell_script(resume: &ResumeCommand, shell: &str) -> String {
+    format!("{} || true && exec {shell} -i", resume.text())
 }
 
 fn user_shell() -> String {
@@ -298,7 +350,7 @@ fn user_shell() -> String {
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
-fn window_title(cwd: &Path) -> String {
+fn window_title(label: &str, cwd: &Path) -> String {
     let name = cwd
         .file_name()
         .and_then(|name| name.to_str())
@@ -307,20 +359,20 @@ fn window_title(cwd: &Path) -> String {
         .chars()
         .filter(|ch| !ch.is_control() && *ch != ';' && *ch != '"')
         .collect();
-    format!("Claude: {clean}")
+    format!("{label}: {clean}")
 }
 
 /// Expands `{cwd}`, `{session_id}`, and `{command}` (the full resume
 /// command) with shell-quoted values.
-fn expand_template(template: &str, cwd: &Path, session_id: &str) -> String {
+fn expand_template(template: &str, cwd: &Path, resume: &ResumeCommand) -> String {
     let cwd_text = cwd.display().to_string();
     let (quoted_cwd, command) = if cfg!(windows) {
         let quoted = format!("\"{cwd_text}\"");
-        let command = format!("cd /d {quoted} && claude --resume {session_id}");
+        let command = format!("cd /d {quoted} && {}", resume.text());
         (quoted, command)
     } else {
         let quoted = sh_quote(&cwd_text);
-        let command = format!("cd {quoted} && claude --resume {session_id}");
+        let command = format!("cd {quoted} && {}", resume.text());
         (quoted, command)
     };
     let quoted_command = if cfg!(windows) {
@@ -330,7 +382,7 @@ fn expand_template(template: &str, cwd: &Path, session_id: &str) -> String {
     };
     template
         .replace("{cwd}", &quoted_cwd)
-        .replace("{session_id}", session_id)
+        .replace("{session_id}", &resume.session_id)
         .replace("{command}", &quoted_command)
 }
 
@@ -354,6 +406,10 @@ mod tests {
 
     const ID: &str = "00000000-0000-4000-8000-000000000001";
 
+    fn resume() -> ResumeCommand {
+        ResumeCommand::claude(ID, None).expect("safe command")
+    }
+
     fn custom(window: Option<&str>, tab: Option<&str>) -> Launcher {
         Launcher::Custom {
             window: window.map(str::to_string),
@@ -368,7 +424,7 @@ mod tests {
             distro: "Ubuntu".to_string(),
         };
         let cwd = Path::new("/home/user/my;app");
-        let (program, window) = launcher.command(cwd, ID, Placement::Window);
+        let (program, window) = launcher.command(cwd, &resume(), Placement::Window);
         assert_eq!(program, PathBuf::from("/mnt/c/wt.exe"));
         assert_eq!(&window[..3], ["-w", "new", "new-tab"]);
         assert_eq!(window[4], "Claude: myapp");
@@ -384,7 +440,7 @@ mod tests {
         assert!(script.starts_with(&format!("claude --resume {ID} || true && exec ")));
         assert!(!script.contains(';'));
 
-        let (_, tab) = launcher.command(cwd, ID, Placement::Tab);
+        let (_, tab) = launcher.command(cwd, &resume(), Placement::Tab);
         assert_eq!(&tab[..3], ["-w", "0", "new-tab"]);
         assert_eq!(&tab[3..], &window[3..]);
         assert!(launcher.supports(Placement::Window) && launcher.supports(Placement::Tab));
@@ -393,7 +449,8 @@ mod tests {
 
     #[test]
     fn tmux_opens_tabs_only() {
-        let (program, args) = Launcher::Tmux.command(Path::new("/srv/app"), ID, Placement::Tab);
+        let (program, args) =
+            Launcher::Tmux.command(Path::new("/srv/app"), &resume(), Placement::Tab);
         assert_eq!(program, PathBuf::from("tmux"));
         assert_eq!(&args[..3], ["new-window", "-c", "/srv/app"]);
         assert!(args[5].contains(&format!("claude --resume {ID}")));
@@ -410,7 +467,7 @@ mod tests {
         );
         let cwd = Path::new("/home/user/it's my app");
         let run = |placement| {
-            let (program, args) = launcher.command(cwd, ID, placement);
+            let (program, args) = launcher.command(cwd, &resume(), placement);
             let output = Command::new(program).args(args).output().expect("run sh");
             String::from_utf8_lossy(&output.stdout).into_owned()
         };
@@ -432,6 +489,29 @@ mod tests {
     }
 
     #[test]
+    fn resume_commands_keep_only_shell_safe_words() {
+        assert_eq!(
+            ResumeCommand::claude(ID, Some("parser-2")).map(|c| c.text()),
+            Some(format!("claude --resume {ID} --name parser-2"))
+        );
+        assert_eq!(
+            ResumeCommand::claude(ID, Some("my app; rm")).map(|c| c.text()),
+            Some(format!("claude --resume {ID}")),
+            "an unsafe name is left out"
+        );
+        assert_eq!(ResumeCommand::claude("x;y", None), None);
+        let codex = ResumeCommand::new(
+            "Codex",
+            "abc",
+            vec!["codex".to_string(), "resume".to_string(), "abc".to_string()],
+        )
+        .expect("safe");
+        let (_, args) = Launcher::Tmux.command(Path::new("/srv"), &codex, Placement::Tab);
+        assert_eq!(args[4], "Codex: srv");
+        assert!(args[5].contains("codex resume abc || true && exec "));
+    }
+
+    #[test]
     fn url_opener_passes_the_url_as_one_argument() {
         let url = "https://claude.ai/settings/usage";
         if let Some((_, args)) = url_opener(url) {
@@ -442,11 +522,11 @@ mod tests {
     #[test]
     fn open_reports_a_failing_launcher() {
         let error = custom(Some("echo nope >&2 && exit 3"), None)
-            .open(Path::new("/"), ID, Placement::Window)
+            .open(Path::new("/"), &resume(), Placement::Window)
             .expect_err("launcher fails");
         assert!(error.to_string().contains("nope"), "{error}");
         custom(Some("true"), None)
-            .open(Path::new("/"), ID, Placement::Window)
+            .open(Path::new("/"), &resume(), Placement::Window)
             .expect("launcher succeeds");
     }
 }

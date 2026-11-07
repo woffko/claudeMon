@@ -92,7 +92,17 @@ never stored or refreshed by claudemon.
   `resume_terminal_tab_command` (tab), for example
   `"gnome-terminal --working-directory={cwd} -- bash -ic {command}"`
   (`{cwd}`, `{session_id}`, and `{command}` are shell-quoted).
-
+- **RECENT** - coding-agent sessions used in the last day, week, or month
+  (`d`), with whether each one is running now: Claude Code, Codex,
+  opencode, and Antigravity (`agy`). Running sessions show their status
+  (busy / idle / waiting / shell for Claude Code), PID, and terminal; a
+  stopped one has a RUN button. RUN or `t` resumes it in a new terminal tab
+  (a window when the terminal has no tabs), Enter or double-click in a new
+  window, with the agent's own command
+  (`claude --resume`, `codex resume`, `opencode -s`,
+  `agy --conversation`) in the session's directory; `y` copies it. The list
+  is re-read every 15 seconds while the screen is shown. Only local files
+  and `/proc` are read; no requests are made and no tokens are used.
 
 Usage history is kept in claudemon's cache even after Claude Code deletes old
 transcripts (`cleanupPeriodDays`, 30 days by default).

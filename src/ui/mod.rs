@@ -1,5 +1,6 @@
 pub(crate) mod apistat;
 pub(crate) mod cost;
+pub(crate) mod recent;
 
 use crate::app::{
     AccentTheme, ActiveScreen, AppState, BarFillMode, ChartOrientation, UiClickAction, UiHitTarget,
@@ -299,6 +300,18 @@ pub fn render(frame: &mut Frame<'_>, state: &mut AppState) {
                 render_help_overlay(frame, area, state.active_screen);
             }
         }
+        ActiveScreen::Recent => {
+            let footer_height = footer_height(inner.width, state);
+            let chunks = usage_screen_layout(inner, footer_height);
+
+            recent::render_header(frame, chunks[0], state);
+            recent::render(frame, chunks[1], state);
+            render_footer(frame, chunks[2], state);
+
+            if state.show_help {
+                render_help_overlay(frame, area, state.active_screen);
+            }
+        }
         ActiveScreen::Read => {
             let system_locale = state.system_locale.clone();
             let formatter = DisplayFormatter::new(state.display_style, &system_locale);
@@ -367,6 +380,10 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
             " HISTORY ",
             Some(UiClickAction::SetScreen(ActiveScreen::Read)),
         ),
+        (
+            " RECENT ",
+            Some(UiClickAction::SetScreen(ActiveScreen::Recent)),
+        ),
     ];
     let app_title_width = UnicodeWidthStr::width(app_title().as_str());
     let navigation_width = segments
@@ -388,6 +405,7 @@ fn navigation_title(area: Rect, active_screen: ActiveScreen) -> (Line<'static>, 
         pill("COST", active_screen == ActiveScreen::Cost),
         pill("ACTIVITY", active_screen == ActiveScreen::Activity),
         pill("HISTORY", active_screen == ActiveScreen::Read),
+        pill("RECENT", active_screen == ActiveScreen::Recent),
     ]);
     (line, right_aligned_targets(title_area, &segments))
 }
@@ -737,6 +755,9 @@ fn footer_hint(screen: ActiveScreen) -> &'static str {
         ActiveScreen::Cost => {
             "Cost: Dates [d] (all/7d/30d), Zone [z on USAGE], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
+        ActiveScreen::Recent => {
+            "Recent: Select [up/down/wheel/click], Open stopped session [RUN/t: new tab, Enter/double-click: new window], Copy command [y], Dates [d] (day/week/month), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+        }
         ActiveScreen::Read => "",
     }
 }
@@ -750,7 +771,7 @@ fn footer_error(state: &AppState) -> String {
         ActiveScreen::Activity => state.usage_error.as_deref(),
         ActiveScreen::ApiStat => state.limits_error.as_deref(),
         ActiveScreen::Cost => state.usage_error.as_deref(),
-        ActiveScreen::Read => None,
+        ActiveScreen::Read | ActiveScreen::Recent => None,
     }
     .unwrap_or("");
     if err.is_empty() {
@@ -3958,6 +3979,20 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  ?    - toggle help"),
             Line::from("  q    - quit (confirm)"),
         ]),
+        ActiveScreen::Recent => Text::from(vec![
+            Line::from("Keys:"),
+            Line::from("  Up/Down, wheel - select a session"),
+            Line::from("  RUN, t - resume a stopped session in a new tab (a window without tabs)"),
+            Line::from("  Enter, double-click - resume it in a new window"),
+            Line::from("  y    - copy the resume command"),
+            Line::from("  d    - cycle dates (day / week / month)"),
+            Line::from("  r/F5 - refresh now (otherwise every 15 s while shown)"),
+            Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
+            Line::from("  c    - cycle color theme"),
+            Line::from("  s/F2 - switch screen"),
+            Line::from("  ?    - toggle help"),
+            Line::from("  q    - quit (confirm)"),
+        ]),
         ActiveScreen::Read => Text::from(vec![
             Line::from("Keys:"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
@@ -5469,32 +5504,37 @@ mod tests {
     fn navigation_tabs_are_clickable_on_the_outer_border() {
         let (title, targets) = navigation_title(Rect::new(4, 2, 80, 20), ActiveScreen::Activity);
 
-        assert_eq!(title.width(), 42);
-        assert_eq!(targets.len(), 5);
-        assert_eq!(targets[0].area, Rect::new(42, 2, 7, 1));
+        assert_eq!(title.width(), 50);
+        assert_eq!(targets.len(), 6);
+        assert_eq!(targets[0].area, Rect::new(34, 2, 7, 1));
         assert_eq!(
             targets[0].action,
             UiClickAction::SetScreen(ActiveScreen::Usage)
         );
-        assert_eq!(targets[1].area, Rect::new(49, 2, 9, 1));
+        assert_eq!(targets[1].area, Rect::new(41, 2, 9, 1));
         assert_eq!(
             targets[1].action,
             UiClickAction::SetScreen(ActiveScreen::ApiStat)
         );
-        assert_eq!(targets[2].area, Rect::new(58, 2, 6, 1));
+        assert_eq!(targets[2].area, Rect::new(50, 2, 6, 1));
         assert_eq!(
             targets[2].action,
             UiClickAction::SetScreen(ActiveScreen::Cost)
         );
-        assert_eq!(targets[3].area, Rect::new(64, 2, 10, 1));
+        assert_eq!(targets[3].area, Rect::new(56, 2, 10, 1));
         assert_eq!(
             targets[3].action,
             UiClickAction::SetScreen(ActiveScreen::Activity)
         );
-        assert_eq!(targets[4].area, Rect::new(74, 2, 9, 1));
+        assert_eq!(targets[4].area, Rect::new(66, 2, 9, 1));
         assert_eq!(
             targets[4].action,
             UiClickAction::SetScreen(ActiveScreen::Read)
+        );
+        assert_eq!(targets[5].area, Rect::new(75, 2, 8, 1));
+        assert_eq!(
+            targets[5].action,
+            UiClickAction::SetScreen(ActiveScreen::Recent)
         );
     }
 
@@ -5506,8 +5546,8 @@ mod tests {
         );
         let (navigation, targets) =
             navigation_title(Rect::new(0, 0, 80, 24), ActiveScreen::ApiStat);
-        assert_eq!(navigation.width(), 42);
-        assert_eq!(targets.len(), 5);
+        assert_eq!(navigation.width(), 50);
+        assert_eq!(targets.len(), 6);
     }
 
     #[test]
