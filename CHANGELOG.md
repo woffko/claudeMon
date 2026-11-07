@@ -36,6 +36,13 @@ All notable changes to this project are documented in this file.
   usage, usage by surface) and a MODELS view (tokens per day per model,
   date ranges, per-model cards, copy to clipboard).
 - Removed the Codex limit-reset screen and reset button.
+- Per-model weekly limits (such as Fable) with the status-line source,
+  read from Claude Code's cached `/usage` response in `~/.claude.json`
+  and labeled with its age; scoped limits show their share of the weekly
+  limit.
+- LIMITS shows the limit-reset status with `--live-limits oauth` (resets
+  left, use-by date, limits refilled, or why none is offered); `o` or the
+  CLAUDE.AI button opens claude.ai/settings/usage.
 - COST screen: API-equivalent cost at list prices by day, model, and
   project, with Claude Code's recorded session costs as a cross-check.
   Prices live in `config.json` (`pricing`, `pricing_updated`).

@@ -349,6 +349,7 @@ pub(crate) enum UiClickAction {
     SetModelsRange(ModelsRange),
     SetCostRange(ModelsRange),
     CopyModelsTable,
+    OpenUsagePage,
     ScrollUsageOlder,
     ScrollUsageNewer,
     SetUsageScrollOffset(usize),
@@ -425,6 +426,7 @@ enum ApiStatCommand {
     ToggleView,
     CycleModelsRange,
     CopyModelsTable,
+    OpenUsagePage,
     ToggleHelp,
 }
 
@@ -493,6 +495,8 @@ pub(crate) struct AppState {
     pub(crate) live_limits_mode: LiveLimitsMode,
     /// Transient notice on the APISTAT screen (for example after a copy).
     pub(crate) api_stat_notice: Option<String>,
+    /// Web page to open in the browser after this input event.
+    pub(crate) open_url_request: Option<&'static str>,
     pub(crate) clipboard_request: Option<String>,
     pub(crate) read_browser: crate::read::tui::BrowserState,
 }
@@ -508,6 +512,8 @@ const INPUT_PAUSE_SETTLE: Duration = Duration::from_millis(200);
 pub(crate) const DEFAULT_ACTIVITY_PROJECT_LIMIT: usize = 5;
 pub(crate) const MIN_ACTIVITY_PROJECT_LIMIT: usize = 1;
 pub(crate) const MAX_ACTIVITY_PROJECT_LIMIT: usize = 50;
+/// claude.ai page with the usage limits and the limit-reset button.
+const CLAUDE_USAGE_URL: &str = "https://claude.ai/settings/usage";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PersistedUiState {
@@ -1041,6 +1047,7 @@ async fn run_inner(
         limits_enabled: true,
         live_limits_mode: config.live_limits_mode,
         api_stat_notice: None,
+        open_url_request: None,
         clipboard_request: None,
         read_browser,
     };
@@ -1114,6 +1121,18 @@ async fn run_inner(
                             dirty = true;
                         }
                         None => {}
+                    }
+                    if let Some(url) = state.open_url_request.take() {
+                        let opened =
+                            tokio::task::spawn_blocking(move || crate::launch::open_url(url))
+                                .await;
+                        state.api_stat_notice = Some(match opened {
+                            Ok(Ok(())) => "Opened claude.ai usage settings in the browser."
+                                .to_string(),
+                            Ok(Err(error)) => format!("Could not open {url}: {error}"),
+                            Err(error) => format!("Could not open {url}: {error}"),
+                        });
+                        dirty = true;
                     }
                 }
             }
@@ -1641,6 +1660,11 @@ fn apply_ui_click_action(state: &mut AppState, action: UiClickAction) -> bool {
             copy_models_table(state);
             true
         }
+        UiClickAction::OpenUsagePage => {
+            state.api_stat_notice = None;
+            state.open_url_request = Some(CLAUDE_USAGE_URL);
+            true
+        }
         UiClickAction::ScrollUsageOlder => scroll_usage_periods(state, 1, true),
         UiClickAction::ScrollUsageNewer => scroll_usage_periods(state, 1, false),
         UiClickAction::SetUsageScrollOffset(offset) => {
@@ -1827,6 +1851,9 @@ fn map_event_to_api_stat_cmd(event: Event) -> Option<ApiStatCommand> {
             }
             (KeyCode::Char('d'), _) | (KeyCode::Char('D'), _) => {
                 Some(ApiStatCommand::CycleModelsRange)
+            }
+            (KeyCode::Char('o'), _) | (KeyCode::Char('O'), _) => {
+                Some(ApiStatCommand::OpenUsagePage)
             }
             (KeyCode::Char('?'), _) => Some(ApiStatCommand::ToggleHelp),
             _ => None,
@@ -2051,6 +2078,10 @@ fn handle_api_stat_command(
             copy_models_table(state);
             true
         }
+        ApiStatCommand::OpenUsagePage => {
+            state.open_url_request = Some(CLAUDE_USAGE_URL);
+            true
+        }
     }
 }
 
@@ -2212,11 +2243,22 @@ fn limits_refresh_interval(mode: LiveLimitsMode, configured_secs: u64) -> Durati
 fn read_live_limits(mode: LiveLimitsMode, claude_dir: &Path, claudemon_home: &Path) -> AppEvent {
     match mode {
         LiveLimitsMode::StatusLine => {
-            match crate::limits::statusline::load(claudemon_home, crate::limits::unix_now()) {
-                Ok(Some(limits)) => AppEvent::LimitsUpdated(Ok(limits)),
-                Ok(None) => AppEvent::LimitsUnavailable {
-                    message: STATUSLINE_SETUP_HINT.to_string(),
-                    is_error: false,
+            let now = crate::limits::unix_now();
+            // Claude Code's cached /usage response is optional: an unreadable
+            // cache only means no per-model limits.
+            let cached = crate::limits::claude_cache::load(claude_dir, now)
+                .ok()
+                .flatten();
+            match crate::limits::statusline::load(claudemon_home, now) {
+                Ok(Some(limits)) => {
+                    AppEvent::LimitsUpdated(Ok(crate::limits::claude_cache::merge(limits, cached)))
+                }
+                Ok(None) => match cached {
+                    Some(cached) => AppEvent::LimitsUpdated(Ok(cached)),
+                    None => AppEvent::LimitsUnavailable {
+                        message: STATUSLINE_SETUP_HINT.to_string(),
+                        is_error: false,
+                    },
                 },
                 Err(error) => AppEvent::LimitsUpdated(Err(error)),
             }
@@ -2858,13 +2900,28 @@ mod tests {
     }
 
     #[test]
-    fn statusline_source_reports_setup_hint_until_a_snapshot_exists() {
+    fn statusline_source_reports_setup_hint_until_limits_exist() {
         let claudemon_home = make_temp_dir("limits-source");
         let claude_dir = make_temp_dir("limits-source-claude");
         match read_live_limits(LiveLimitsMode::StatusLine, &claude_dir, &claudemon_home) {
             AppEvent::LimitsUnavailable { message, is_error } => {
                 assert!(!is_error);
                 assert_eq!(message, STATUSLINE_SETUP_HINT);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        // Without a status-line snapshot, Claude Code's cached usage is shown.
+        std::fs::write(
+            claude_dir.join(".claude.json"),
+            r#"{"cachedUsageUtilization": {"fetchedAtMs": 1000, "utilization": {"limits": [
+                {"kind": "weekly_scoped", "group": "weekly", "percent": 3, "resets_at": null,
+                 "scope": {"model": {"display_name": "Fable"}}}]}}}"#,
+        )
+        .expect("write synthetic config");
+        match read_live_limits(LiveLimitsMode::StatusLine, &claude_dir, &claudemon_home) {
+            AppEvent::LimitsUpdated(Ok(limits)) => {
+                assert_eq!(limits.source, crate::limits::LimitsSourceKind::ClaudeCache);
+                assert_eq!(limits.buckets[0].limit_name.as_deref(), Some("Fable"));
             }
             other => panic!("unexpected event: {other:?}"),
         }

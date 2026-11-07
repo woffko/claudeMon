@@ -1,5 +1,5 @@
 //! Opening a resumed Claude Code session in a new terminal window or tab,
-//! so the claudemon TUI stays open.
+//! so the claudemon TUI stays open, and opening web pages in the browser.
 
 use anyhow::{Context, Result};
 use std::io::Read;
@@ -202,44 +202,86 @@ impl Launcher {
     /// to run on their own.
     pub fn open(&self, cwd: &Path, session_id: &str, placement: Placement) -> Result<()> {
         let (program, args) = self.command(cwd, session_id, placement);
-        let mut child = Command::new(&program)
-            .args(&args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("Unable to start {}", program.display()))?;
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if status.success() {
-                    return Ok(());
-                }
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                let detail = stderr.lines().next().unwrap_or("").trim();
-                anyhow::bail!(
-                    "{} exited with {status}{}",
-                    program.display(),
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
-                );
-            }
-            if started.elapsed() >= LAUNCH_WAIT {
-                // Still running: let it continue and reap it in the background.
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
+        run_launcher(&program, &args, Some(cwd))
+    }
+}
+
+/// Opens `url` in the default browser. Blocking for at most a few seconds.
+pub fn open_url(url: &str) -> Result<()> {
+    let (program, args) = url_opener(url).context("No program to open a browser was found")?;
+    run_launcher(&program, &args, None)
+}
+
+/// Program and arguments that open `url`: the OS handler, `wslview` or the
+/// Windows URL handler under WSL, else `xdg-open`.
+fn url_opener(url: &str) -> Option<(PathBuf, Vec<String>)> {
+    let windows_handler = |program: PathBuf| {
+        (
+            program,
+            vec!["url.dll,FileProtocolHandler".to_string(), url.to_string()],
+        )
+    };
+    if cfg!(windows) {
+        return Some(windows_handler(PathBuf::from("rundll32")));
+    }
+    if cfg!(target_os = "macos") {
+        return Some((PathBuf::from("open"), vec![url.to_string()]));
+    }
+    if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+        if let Some(wslview) = find_in_path("wslview") {
+            return Some((wslview, vec![url.to_string()]));
+        }
+        if let Some(rundll32) = find_in_path("rundll32.exe") {
+            return Some(windows_handler(rundll32));
+        }
+    }
+    find_in_path("xdg-open").map(|program| (program, vec![url.to_string()]))
+}
+
+/// Runs a launcher and reports a quick failure with its first stderr line.
+/// A launcher still running after a few seconds is left to run on its own.
+fn run_launcher(program: &Path, args: &[String], cwd: Option<&Path>) -> Result<()> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("Unable to start {}", program.display()))?;
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if status.success() {
                 return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(50));
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            let detail = stderr.lines().next().unwrap_or("").trim();
+            anyhow::bail!(
+                "{} exited with {status}{}",
+                program.display(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {detail}")
+                }
+            );
         }
+        if started.elapsed() >= LAUNCH_WAIT {
+            // Still running: let it continue and reap it in the background.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -387,6 +429,14 @@ mod tests {
             Launcher::detect(Some("  "), Some("")).is_some(),
             Launcher::detect(None, None).is_some()
         );
+    }
+
+    #[test]
+    fn url_opener_passes_the_url_as_one_argument() {
+        let url = "https://claude.ai/settings/usage";
+        if let Some((_, args)) = url_opener(url) {
+            assert_eq!(args.last().map(String::as_str), Some(url));
+        }
     }
 
     #[test]

@@ -7,15 +7,18 @@
 //! refreshed, or written; an expired token is reported instead.
 
 use super::{
-    as_f64, as_unix_seconds, unix_now, AccountRateLimits, ExtraUsage, LimitsSourceKind,
-    RateLimitSnapshot, RateLimitWindow, SurfaceShare, FIVE_HOUR_WINDOW_MINS, SEVEN_DAY_WINDOW_MINS,
+    as_f64, as_unix_seconds, unix_now, AccountRateLimits, ExtraUsage, LimitResetStatus,
+    LimitsSourceKind, RateLimitSnapshot, RateLimitWindow, ResetGrant, SurfaceShare,
+    FIVE_HOUR_WINDOW_MINS, SEVEN_DAY_WINDOW_MINS,
 };
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::path::Path;
 use std::time::Duration;
 
-const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// `cedar_ember=1` asks for the limit-reset status as well, as Claude Code
+/// does before offering `/limit-reset`.
+const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
@@ -148,7 +151,10 @@ pub(crate) fn parse_usage(value: &Value, now: i64) -> Result<AccountRateLimits> 
     let mut limits = AccountRateLimits::empty(LimitsSourceKind::OAuth, now);
 
     if let Some(entries) = value.get("limits").and_then(Value::as_array) {
+        // Bucket index of each `limits[]` entry, for `weekly_scoped_shares`.
+        let mut bucket_of_entry: Vec<Option<usize>> = Vec::with_capacity(entries.len());
         for entry in entries {
+            let mut bucket_index = None;
             let window = RateLimitWindow {
                 used_percent: entry.get("percent").and_then(as_f64),
                 window_duration_mins: None,
@@ -174,6 +180,7 @@ pub(crate) fn parse_usage(value: &Value, now: i64) -> Result<AccountRateLimits> 
                 _ => {
                     let name =
                         scope_name(entry.get("scope")).unwrap_or_else(|| kind.replace('_', " "));
+                    bucket_index = Some(limits.buckets.len());
                     limits.buckets.push(RateLimitSnapshot {
                         limit_name: Some(name.clone()),
                         primary: Some(RateLimitWindow {
@@ -181,12 +188,30 @@ pub(crate) fn parse_usage(value: &Value, now: i64) -> Result<AccountRateLimits> 
                                 .then_some(SEVEN_DAY_WINDOW_MINS),
                             ..window
                         }),
+                        share_of_weekly: None,
                     });
                     name
                 }
             };
+            bucket_of_entry.push(bucket_index);
             if entry.get("is_active").and_then(Value::as_bool) == Some(true) {
                 limits.active_limit = Some(name);
+            }
+        }
+        for share in value
+            .get("weekly_scoped_shares")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let bucket = share
+                .get("limit_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| bucket_of_entry.get(usize::try_from(index).ok()?).copied())
+                .flatten();
+            if let Some(bucket) = bucket {
+                limits.buckets[bucket].share_of_weekly =
+                    share.get("allowance_percent_of_weekly").and_then(as_f64);
             }
         }
     } else {
@@ -202,17 +227,23 @@ pub(crate) fn parse_usage(value: &Value, now: i64) -> Result<AccountRateLimits> 
         };
         limits.primary = window("five_hour", FIVE_HOUR_WINDOW_MINS);
         limits.secondary = window("seven_day", SEVEN_DAY_WINDOW_MINS);
-        for (key, name) in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")] {
+        for (key, name) in [
+            ("seven_day_opus", "Opus"),
+            ("seven_day_sonnet", "Sonnet"),
+            ("seven_day_overage_included", "Fable"),
+        ] {
             if let Some(scoped) = window(key, SEVEN_DAY_WINDOW_MINS) {
                 limits.buckets.push(RateLimitSnapshot {
                     limit_name: Some(name.to_string()),
                     primary: Some(scoped),
+                    share_of_weekly: None,
                 });
             }
         }
     }
 
     limits.extra_usage = parse_extra_usage(value);
+    limits.limit_reset = value.get("cedar_ember").and_then(parse_limit_reset);
     if let Some(rows) = value
         .get("seven_day_breakdown")
         .and_then(|breakdown| breakdown.get("rows"))
@@ -244,6 +275,77 @@ fn scope_name(scope: Option<&Value>) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
+}
+
+/// Limit-reset status from the `cedar_ember` object (present when asked for
+/// with `cedar_ember=1`). Malformed grants are skipped.
+fn parse_limit_reset(value: &Value) -> Option<LimitResetStatus> {
+    let eligible = value.get("eligible").and_then(Value::as_bool)?;
+    let count = |grant: &Value, key: &str| {
+        grant
+            .get(key)
+            .and_then(Value::as_u64)
+            .map(|count| u32::try_from(count).unwrap_or(u32::MAX))
+    };
+    let flag = |grant: &Value, key: &str, default: bool| {
+        grant.get(key).and_then(Value::as_bool).unwrap_or(default)
+    };
+    let grants = value
+        .get("grants")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|grant| {
+            let resets_left = count(grant, "resets_left")?;
+            Some(ResetGrant {
+                label: grant
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|label| !label.is_empty())
+                    .map(str::to_string),
+                resets_left,
+                resets_total: count(grant, "resets_total").unwrap_or(0).max(resets_left),
+                ends_at: grant.get("ends_at").and_then(as_unix_seconds),
+                clears: grant
+                    .get("clears")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(limit_type_name)
+                    .collect(),
+                paused: flag(grant, "paused", false),
+                usable_now: flag(grant, "usable_now", false),
+                requires_limit: flag(grant, "use_requires_limit", true),
+            })
+        })
+        .collect();
+    Some(LimitResetStatus {
+        eligible,
+        ineligible_reason: value
+            .get("ineligible_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        at_limit: value
+            .get("at_limit")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        grants,
+        cooldown_until: value.get("cooldown_until").and_then(as_unix_seconds),
+    })
+}
+
+/// Display name of a rate-limit type as Claude Code names it.
+fn limit_type_name(key: &str) -> String {
+    match key {
+        "five_hour" => "5h session".to_string(),
+        "seven_day" => "weekly".to_string(),
+        "seven_day_opus" => "Opus weekly".to_string(),
+        "seven_day_sonnet" => "Sonnet weekly".to_string(),
+        "seven_day_overage_included" => "Fable weekly".to_string(),
+        other => other.replace('_', " "),
+    }
 }
 
 /// Extra usage from `spend` (amounts in minor units with an exponent), with
@@ -315,7 +417,23 @@ mod tests {
             "seven_day_breakdown": {"rows": [
                 {"key": "claude_code", "display_name": "Claude Code", "percent": 99},
                 {"key": "chat", "display_name": "Chats", "percent": 1}
-            ]}
+            ]},
+            "weekly_scoped_shares": [
+                {"limit_index": 2, "used_percent_of_weekly": 0, "allowance_percent_of_weekly": 50},
+                {"limit_index": 0, "allowance_percent_of_weekly": 10},
+                {"limit_index": 9, "allowance_percent_of_weekly": 10}
+            ],
+            "cedar_ember": {
+                "eligible": true, "at_limit": false, "next_grant_id": "g1",
+                "grants": [
+                    {"id": "g1", "label": "Launch reset", "resets_total": 2, "resets_left": 1,
+                     "starts_at": "2026-09-20T00:00:00+00:00", "ends_at": "2026-10-04T00:00:00+00:00",
+                     "clears": ["five_hour", "seven_day", "seven_day_overage_included", "new_kind"],
+                     "paused": false, "usable_now": false, "use_requires_limit": true,
+                     "percent_used": {}, "blocking": []},
+                    {"id": "broken", "resets_left": -1}
+                ]
+            }
         })
     }
 
@@ -330,6 +448,11 @@ mod tests {
         assert_eq!(weekly.used_percent, Some(13.0));
         assert_eq!(limits.buckets.len(), 1);
         assert_eq!(limits.buckets[0].limit_name.as_deref(), Some("Fable"));
+        assert_eq!(
+            limits.buckets[0].share_of_weekly,
+            Some(50.0),
+            "shares map limits[] indexes to buckets; non-bucket indexes are ignored"
+        );
         assert_eq!(limits.active_limit.as_deref(), Some("Weekly"));
         assert_eq!(
             limits.surfaces,
@@ -348,6 +471,38 @@ mod tests {
         assert!(!extra.enabled);
         assert_eq!(extra.used_amount, Some(12.5));
         assert_eq!(extra.currency.as_deref(), Some("USD"));
+
+        let reset = limits.limit_reset.expect("reset status");
+        assert!(reset.eligible && !reset.at_limit);
+        assert_eq!(reset.grants.len(), 1, "the malformed grant is skipped");
+        let grant = &reset.grants[0];
+        assert_eq!(grant.label.as_deref(), Some("Launch reset"));
+        assert_eq!((grant.resets_left, grant.resets_total), (1, 2));
+        assert_eq!(grant.ends_at, Some(1_791_072_000));
+        assert_eq!(
+            grant.clears,
+            ["5h session", "weekly", "Fable weekly", "new kind"]
+        );
+        assert!(grant.requires_limit && !grant.usable_now && !grant.paused);
+        assert_eq!(reset.resets_left(), 1);
+        assert_eq!(reset.next_grant(), Some(grant));
+    }
+
+    #[test]
+    fn parse_usage_reads_an_ineligible_reset_status() {
+        let value = serde_json::json!({
+            "cedar_ember": {"eligible": false, "ineligible_reason": "no_grant"}
+        });
+        let reset = parse_usage(&value, 1)
+            .expect("parse")
+            .limit_reset
+            .expect("reset status");
+        assert!(!reset.eligible);
+        assert_eq!(reset.ineligible_reason.as_deref(), Some("no_grant"));
+        assert_eq!(reset.resets_left(), 0);
+        assert_eq!(reset.next_grant(), None);
+        let missing = parse_usage(&serde_json::json!({"cedar_ember": null}), 1).expect("parse");
+        assert_eq!(missing.limit_reset, None);
     }
 
     #[test]
@@ -355,12 +510,14 @@ mod tests {
         let value = serde_json::json!({
             "five_hour": {"utilization": 55.5, "resets_at": "2026-09-26T08:40:00+00:00"},
             "seven_day": null,
-            "seven_day_opus": {"utilization": 20, "resets_at": null}
+            "seven_day_opus": {"utilization": 20, "resets_at": null},
+            "seven_day_overage_included": {"utilization": 7, "resets_at": null}
         });
         let limits = parse_usage(&value, 1).expect("parse");
         assert_eq!(limits.primary.and_then(|w| w.used_percent), Some(55.5));
         assert_eq!(limits.secondary, None);
         assert_eq!(limits.buckets[0].limit_name.as_deref(), Some("Opus"));
+        assert_eq!(limits.buckets[1].limit_name.as_deref(), Some("Fable"));
         assert_eq!(limits.extra_usage, None);
     }
 

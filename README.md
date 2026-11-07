@@ -51,10 +51,19 @@ claudemon statusline --wrap 'your-status-line-command'
 The snapshot is stored in `~/.claudemon/limits.json` and updates while
 Claude Code runs.
 
+Per-model weekly limits (for example the separate Fable limit) are not in
+the status-line input. claudemon adds them from the copy of the last
+`/usage` response that Claude Code keeps in its own config file
+(`cachedUsageUtilization` in `~/.claude.json`), shown with its age. Claude
+Code refreshes that copy when it calls the usage endpoint, for example on
+`/usage`.
+
 **OAuth usage endpoint (opt-in).** `claudemon --live-limits oauth` (or
 `"live_limits": "oauth"` in `~/.claudemon/config.json`) calls the endpoint
 behind Claude Code's `/usage` screen with Claude Code's OAuth token. It adds
-per-model weekly limits, extra usage, and weekly usage by surface. The
+fresh per-model weekly limits, extra usage, weekly usage by surface, and the
+limit-reset status (resets left, the date to use them by, and which limits
+a reset refills). The
 endpoint is undocumented and may change; the token is read per request and
 never stored or refreshed by claudemon.
 
@@ -64,7 +73,9 @@ never stored or refreshed by claudemon.
   time, and runs per day from `~/.claude/projects` transcripts.
 - **APISTAT** - `v` switches LIMITS (live limits) and MODELS (tokens per day
   per model; `d` cycles all time / 7 days / 30 days; `ctrl+s` copies the
-  table).
+  table). On LIMITS, `o` or the CLAUDE.AI button opens
+  claude.ai/settings/usage, where limit resets are used; claudemon itself
+  never uses a reset.
 - **COST** - API-equivalent cost at list prices by day, model, and project
   (`d` cycles dates). Prices are in `~/.claudemon/config.json` under
   `pricing` (USD per million tokens) and can be edited.

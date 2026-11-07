@@ -10,10 +10,15 @@ values.
 Request:
 
 ```
-GET https://api.anthropic.com/api/oauth/usage
+GET https://api.anthropic.com/api/oauth/usage?cedar_ember=1
 Authorization: Bearer <claudeAiOauth.accessToken>
 anthropic-beta: oauth-2025-04-20
 ```
+
+`cedar_ember=1` adds the limit-reset status (`cedar_ember` below); Claude
+Code sends it before offering `/limit-reset`. Without it the field is null
+and the rest of the response is the same (checked 2026-10-18, Claude Code
+2.1.302).
 
 No rate-limit headers were returned.
 
@@ -35,6 +40,9 @@ Response (top level):
 | `spend` | object | `used{amount_minor, currency, exponent}`, `limit`, `percent`, `severity`, `enabled`, `disabled_reason`, `cap`, `balance`, `auto_reload`, `disclaimer`, `can_purchase_credits`, `can_toggle` |
 | `seven_day_breakdown` | object | `as_of`, `window_started_at`, `rows[]{key, display_name, percent}`; keys seen: `claude_code`, `chat`, `cowork`, `other` |
 | `member_dashboard_available` | bool | |
+| `weekly_scoped_shares[]` | array | `limit_index` (index into `limits[]`), `used_percent_of_weekly`, `allowance_percent_of_weekly` |
+| `cedar_ember` | object or null | Limit-reset status, see below |
+| `seven_day_overage_included` | window or null | Weekly per-model bucket that Claude Code calls the "Fable limit" (also in the `anthropic-ratelimit-unified-*` response headers) |
 
 `limits[]` entries:
 
@@ -53,6 +61,22 @@ Mapping to `limits::AccountRateLimits`: `session` -> `primary`
 each `weekly_scoped` -> one entry in `buckets` named after
 `scope.model.display_name`. `extra_usage`/`spend` replace the Codex
 credits summary; `seven_day_breakdown` is a new "by surface" row.
+`weekly_scoped_shares` sets `share_of_weekly` on the bucket of
+`limits[limit_index]`.
+
+`cedar_ember` (limit resets):
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `eligible` | bool | |
+| `ineligible_reason` | string or null | `config_off`, `tier`, `seat`, `mobile`, `surface`, `cli_version`, `no_grant`, `tenure`, `other_experiment`, `unavailable`, `unknown`; `surface` was returned to a non-Claude-Code client |
+| `at_limit` | bool | |
+| `exhausted[]` | strings | Limit types at their cap |
+| `grants[]` | array | `id`, `label`, `resets_total`, `resets_left`, `starts_at`, `ends_at`, `clears[]` (limit types: `five_hour`, `seven_day`, `seven_day_overage_included`, ...), `paused`, `usable_now`, `use_requires_limit`, `percent_used{}`, `blocking[]` |
+| `next_grant_id`, `weekly_resets_at`, `cooldown_until` | string or null | |
+
+A reset is used with `POST /api/organizations/{org}/reset_rate_limits`.
+ClaudeMon never sends it: the user resets on claude.ai.
 
 ## S5. Status-line input (documented by Claude Code)
 
@@ -72,4 +96,25 @@ reset time has not passed. The same payload also carries model, session
 cost, context-window usage, and `prompt_cache` health.
 
 S5 needs no credentials, so it is the default source; S1 is opt-in and adds
-per-model weekly limits, extra usage, and the by-surface breakdown.
+per-model weekly limits, extra usage, the by-surface breakdown, and the
+limit-reset status.
+
+## S6. Claude Code's cached usage
+
+Claude Code stores its last S1 response in its global config file
+(`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`):
+
+```
+"cachedUsageUtilization": {
+  "fetchedAtMs": number,       // Unix milliseconds
+  "accountUuid": string,
+  "utilization": { ... }       // the S1 response body
+}
+```
+
+It is refreshed when Claude Code calls S1 itself (for example on `/usage`),
+so it can be hours or days old. With the status-line source, claudemon
+reads only this key and `oauthAccount.accountUuid` (a cache left by another
+account is ignored) and takes the per-model limits, extra usage, and
+by-surface breakdown from it; the newer of S5 and S6 supplies the 5-hour and
+weekly windows.

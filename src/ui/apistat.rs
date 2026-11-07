@@ -2,11 +2,11 @@
 //! usage over time (Models).
 
 use super::{
-    control_group_label, format_compact_kmb, pill, register_right_aligned_targets, resets_label,
-    truncate_middle, weekly_elapsed_allowed_percent,
+    control_group_label, format_compact_kmb, moment_label, pill, register_right_aligned_targets,
+    resets_label, truncate_middle, weekly_elapsed_allowed_percent,
 };
 use crate::app::{ApiStatView, AppState, LiveLimitsMode, ModelsRange, UiClickAction, UiHitTarget};
-use crate::limits::{AccountRateLimits, LimitsSourceKind, RateLimitWindow};
+use crate::limits::{AccountRateLimits, LimitResetStatus, LimitsSourceKind, RateLimitWindow};
 use crate::locale::{DisplayFormatter, DisplayStyle};
 use crate::usage::{
     format_tokens_compact, model_display_name, LocalUsageSnapshot, ModelDailyUsage, TokenBreakdown,
@@ -29,6 +29,8 @@ const GAUGE_WIDTH: usize = 24;
 const MAX_CHART_MODELS: usize = 6;
 const DOT: &str = "\u{25cf}";
 const MIDDLE_DOT: &str = "\u{00b7}";
+/// Width of the section labels ("EXTRA USAGE  ", "RESET        ").
+const SECTION_LABEL_WIDTH: usize = 13;
 
 pub(crate) fn render_header(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     let line_area = super::header_line_area(area);
@@ -96,6 +98,12 @@ fn render_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         pill("LIMITS", state.api_stat_view == ApiStatView::Overview),
         pill("MODELS", state.api_stat_view == ApiStatView::Models),
     ];
+    if state.api_stat_view == ApiStatView::Overview {
+        segments.push((" RESET ", None));
+        spans.push(control_group_label("RESET", accent));
+        segments.push((" CLAUDE.AI ", Some(UiClickAction::OpenUsagePage)));
+        spans.push(pill("CLAUDE.AI", false));
+    }
     if state.api_stat_view == ApiStatView::Models {
         segments.push((" RANGE ", None));
         spans.push(control_group_label("RANGE", accent));
@@ -194,8 +202,7 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         return;
     };
 
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(source_line(limits, now, formatter));
+    let mut lines: Vec<Line<'static>> = source_lines(limits, now);
     if let Some(error) = state.limits_error.as_deref() {
         lines.push(Line::from(Span::styled(
             format!("Last refresh failed: {error}"),
@@ -204,32 +211,56 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     }
     lines.push(Line::from(""));
 
-    let mut rows: Vec<(String, &RateLimitWindow)> = Vec::new();
+    // (label, window, note shown after the reset time)
+    let mut rows: Vec<(String, &RateLimitWindow, Option<String>)> = Vec::new();
     if let Some(window) = limits.primary.as_ref() {
-        rows.push(("5h session".to_string(), window));
+        rows.push(("5h session".to_string(), window, None));
     }
     if let Some(window) = limits.secondary.as_ref() {
-        rows.push(("Weekly".to_string(), window));
+        rows.push(("Weekly".to_string(), window, None));
     }
     for bucket in &limits.buckets {
         if let Some(window) = bucket.primary.as_ref() {
             let name = bucket.limit_name.as_deref().unwrap_or("Scoped");
-            rows.push((format!("Weekly {}", truncate_middle(name, 12)), window));
+            let share = bucket
+                .share_of_weekly
+                .map(|share| format!("{}% of weekly", share.round() as i64));
+            rows.push((
+                format!("Weekly {}", truncate_middle(name, 12)),
+                window,
+                share,
+            ));
         }
     }
     if let Some(window) = limits.spend_limit.as_ref() {
-        rows.push(("Spend limit".to_string(), window));
+        rows.push(("Spend limit".to_string(), window, None));
     }
     if rows.is_empty() {
         lines.push(Line::from("The source reported no limit windows."));
     }
-    for (label, window) in rows {
+    for (label, window, note) in rows {
         let active = limits
             .active_limit
             .as_deref()
             .is_some_and(|active| label.ends_with(active) || active == label);
-        lines.push(limit_row(&label, window, active, now, accent, formatter));
+        let mut row = limit_row(&label, window, active, now, accent, formatter);
+        if let Some(note) = note {
+            row.spans.push(Span::styled(
+                format!("  {MIDDLE_DOT}  {note}"),
+                Style::default().fg(Color::Gray),
+            ));
+        }
+        lines.push(row);
     }
+
+    lines.push(Line::from(""));
+    lines.extend(reset_lines(
+        limits.limit_reset.as_ref(),
+        limits.source,
+        now,
+        accent,
+        formatter,
+    ));
 
     if let Some(extra) = limits.extra_usage.as_ref() {
         lines.push(Line::from(""));
@@ -251,7 +282,7 @@ fn render_overview(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             text.push_str(&format!(" ({}%)", percent.round() as i64));
         }
         lines.push(Line::from(vec![
-            Span::styled("EXTRA USAGE  ", Style::default().fg(Color::Gray)),
+            section_label("EXTRA USAGE"),
             Span::raw(text),
         ]));
     }
@@ -315,32 +346,181 @@ fn setup_text(message: &str, mode: LiveLimitsMode, accent: Color) -> Text<'stati
     Text::from(lines)
 }
 
-fn source_line(
-    limits: &AccountRateLimits,
-    now: i64,
-    formatter: DisplayFormatter<'_>,
-) -> Line<'static> {
-    let age = now.saturating_sub(limits.captured_at).max(0);
-    let captured = super::format_age(age);
-    let (source, stale) = match limits.source {
-        LimitsSourceKind::StatusLine => ("status-line snapshot", age > STALE_SNAPSHOT_SECS),
-        LimitsSourceKind::OAuth => ("OAuth usage endpoint", false),
+/// Where the limits come from and how old they are; a second line when the
+/// per-model limits come from Claude Code's older cached `/usage` response.
+fn source_lines(limits: &AccountRateLimits, now: i64) -> Vec<Line<'static>> {
+    let gray = Style::default().fg(Color::Gray);
+    let age = |captured_at: i64| now.saturating_sub(captured_at).max(0);
+    let snapshot_age = age(limits.captured_at);
+    let (source, stale_hint) = match limits.source {
+        LimitsSourceKind::StatusLine => (
+            "status-line snapshot",
+            (snapshot_age > STALE_SNAPSHOT_SECS).then_some("stale: updates while Claude Code runs"),
+        ),
+        LimitsSourceKind::OAuth => ("OAuth usage endpoint", None),
+        LimitsSourceKind::ClaudeCache => (
+            "Claude Code's cached /usage",
+            (snapshot_age > STALE_SNAPSHOT_SECS).then_some("run /usage in Claude Code to refresh"),
+        ),
     };
     let mut spans = vec![
-        Span::styled("SOURCE  ", Style::default().fg(Color::Gray)),
-        Span::raw(format!("{source}, captured {captured} ago")),
+        Span::styled("SOURCE  ", gray),
+        Span::raw(format!(
+            "{source}, captured {} ago",
+            super::format_age(snapshot_age)
+        )),
     ];
     if let Some(plan) = limits.plan.as_deref() {
         spans.push(Span::raw(format!("  {MIDDLE_DOT}  plan {plan}")));
     }
-    if stale {
+    if let Some(hint) = stale_hint {
         spans.push(Span::styled(
-            "  (stale: updates while Claude Code runs)",
+            format!("  ({hint})"),
             Style::default().fg(Color::Yellow),
         ));
     }
-    let _ = formatter;
-    Line::from(spans)
+    let mut lines = vec![Line::from(spans)];
+    if let Some(details_at) = limits.details_captured_at {
+        let details_age = age(details_at);
+        let mut spans = vec![
+            Span::styled("        ", gray),
+            Span::raw(format!(
+                "per-model limits from Claude Code's cached /usage, captured {} ago",
+                super::format_age(details_age)
+            )),
+        ];
+        if details_age > STALE_SNAPSHOT_SECS {
+            spans.push(Span::styled(
+                "  (run /usage in Claude Code to refresh)",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Readable form of the reason the server gives for offering no reset.
+fn ineligible_reason_text(reason: &str) -> String {
+    match reason {
+        "surface" => "not offered to this client".to_string(),
+        "no_grant" => "no reset granted".to_string(),
+        "tier" => "not offered for this plan".to_string(),
+        "cli_version" => "needs a newer client".to_string(),
+        "config_off" => "turned off".to_string(),
+        other => other.replace('_', " "),
+    }
+}
+
+fn section_label(label: &str) -> Span<'static> {
+    Span::styled(
+        format!("{label:<SECTION_LABEL_WIDTH$}"),
+        Style::default().fg(Color::Gray),
+    )
+}
+
+/// Limit-reset status: resets left, the date to use them by, and what a
+/// reset refills. Resets are used on claude.ai (`o`).
+fn reset_lines(
+    status: Option<&LimitResetStatus>,
+    source: LimitsSourceKind,
+    now: i64,
+    accent: Color,
+    formatter: DisplayFormatter<'_>,
+) -> Vec<Line<'static>> {
+    let gray = Style::default().fg(Color::Gray);
+    let hint = Line::from(vec![
+        section_label(""),
+        Span::styled("o or CLAUDE.AI opens claude.ai/settings/usage", gray),
+    ]);
+    let Some(status) = status else {
+        let text = match source {
+            LimitsSourceKind::OAuth => "status not reported",
+            LimitsSourceKind::StatusLine | LimitsSourceKind::ClaudeCache => {
+                "status needs --live-limits oauth"
+            }
+        };
+        return vec![
+            Line::from(vec![section_label("RESET"), Span::styled(text, gray)]),
+            hint,
+        ];
+    };
+    let mut lines = Vec::new();
+    if !status.eligible {
+        let reason = status
+            .ineligible_reason
+            .as_deref()
+            .map(|reason| format!(" ({})", ineligible_reason_text(reason)))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            section_label("RESET"),
+            Span::raw(format!("none available{reason}")),
+        ]));
+    } else if status.grants.is_empty() {
+        lines.push(Line::from(vec![
+            section_label("RESET"),
+            Span::raw("none left"),
+        ]));
+    }
+    let mut grants: Vec<_> = status.grants.iter().collect();
+    grants.sort_by_key(|grant| grant.ends_at.unwrap_or(i64::MAX));
+    for (index, grant) in grants.into_iter().enumerate() {
+        let mut text = if grant.resets_total > 0 {
+            format!("{} of {} left", grant.resets_left, grant.resets_total)
+        } else {
+            format!("{} left", grant.resets_left)
+        };
+        if let Some(ends_at) = grant.ends_at {
+            if let Some(moment) = moment_label(ends_at, formatter) {
+                text.push_str(&format!(
+                    "  {MIDDLE_DOT}  use by {moment} (in {})",
+                    super::format_age(ends_at.saturating_sub(now))
+                ));
+            }
+        }
+        if !grant.clears.is_empty() {
+            text.push_str(&format!(
+                "  {MIDDLE_DOT}  refills {}",
+                grant.clears.join(", ")
+            ));
+        }
+        let label = if index == 0 { "RESET" } else { "" };
+        let mut spans = vec![section_label(label), Span::raw(text)];
+        let state = if grant.resets_left == 0 {
+            None
+        } else if grant.paused {
+            Some(("paused", Color::Yellow))
+        } else if grant.usable_now {
+            Some(("usable now", accent))
+        } else if grant.requires_limit && !status.at_limit {
+            Some(("usable once a limit is reached", Color::Gray))
+        } else {
+            None
+        };
+        if let Some((state, color)) = state {
+            spans.push(Span::styled(
+                format!("  {MIDDLE_DOT}  {state}"),
+                Style::default().fg(color),
+            ));
+        }
+        if let Some(name) = grant.label.as_deref() {
+            spans.push(Span::styled(format!("  ({name})"), gray));
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(until) = status.cooldown_until.filter(|until| *until > now) {
+        if let Some(moment) = moment_label(until, formatter) {
+            lines.push(Line::from(vec![
+                section_label(""),
+                Span::styled(
+                    format!("cooldown until {moment}"),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+        }
+    }
+    lines.push(hint);
+    lines
 }
 
 fn limit_row(
@@ -807,4 +987,78 @@ pub(crate) fn models_table_text(
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::limits::ResetGrant;
+    use crate::locale::SystemLocale;
+
+    fn plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reset_lines_show_resets_left_use_by_date_and_reasons() {
+        let locale = SystemLocale::default();
+        let formatter = DisplayFormatter::new(DisplayStyle::Classic, &locale);
+        let now = 1_000_000_000;
+        let status = LimitResetStatus {
+            eligible: true,
+            ineligible_reason: None,
+            at_limit: false,
+            grants: vec![ResetGrant {
+                label: None,
+                resets_left: 1,
+                resets_total: 2,
+                ends_at: Some(now + 3 * 86_400),
+                clears: vec!["5h session".to_string(), "weekly".to_string()],
+                paused: false,
+                usable_now: false,
+                requires_limit: true,
+            }],
+            cooldown_until: None,
+        };
+        let render = |status: Option<&LimitResetStatus>, source| {
+            plain(&reset_lines(status, source, now, Color::Cyan, formatter))
+        };
+
+        let lines = render(Some(&status), LimitsSourceKind::OAuth);
+        let dot = MIDDLE_DOT;
+        assert!(
+            lines[0].starts_with(&format!("RESET        1 of 2 left  {dot}  use by ")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[0].ends_with(&format!(
+                "(in 3d 0h)  {dot}  refills 5h session, weekly  {dot}  usable once a limit is reached"
+            )),
+            "{lines:?}"
+        );
+        assert!(lines[1].ends_with("opens claude.ai/settings/usage"));
+
+        let ineligible = LimitResetStatus {
+            eligible: false,
+            ineligible_reason: Some("surface".to_string()),
+            grants: Vec::new(),
+            ..status
+        };
+        assert_eq!(
+            render(Some(&ineligible), LimitsSourceKind::OAuth)[0],
+            "RESET        none available (not offered to this client)"
+        );
+        assert_eq!(
+            render(None, LimitsSourceKind::StatusLine)[0],
+            "RESET        status needs --live-limits oauth"
+        );
+    }
 }

@@ -6,8 +6,13 @@
 //!   snapshot. No credentials are involved.
 //! - OAuth usage endpoint (opt-in): the endpoint behind Claude Code's
 //!   `/usage` screen, called with the user's Claude Code OAuth token. It adds
-//!   per-model weekly limits, extra usage, and the by-surface breakdown.
+//!   per-model weekly limits, extra usage, the by-surface breakdown, and the
+//!   limit-reset status.
+//! - Claude Code's cache: the last `/usage` response Claude Code itself
+//!   saved in its global config file. It fills in the per-model weekly
+//!   limits for the status-line source without credentials.
 
+pub mod claude_cache;
 pub mod oauth;
 pub mod statusline;
 
@@ -21,6 +26,7 @@ pub const SEVEN_DAY_WINDOW_MINS: f64 = 7.0 * 24.0 * 60.0;
 pub enum LimitsSourceKind {
     StatusLine,
     OAuth,
+    ClaudeCache,
 }
 
 impl LimitsSourceKind {
@@ -28,6 +34,7 @@ impl LimitsSourceKind {
         match self {
             Self::StatusLine => "STATUSLINE",
             Self::OAuth => "OAUTH",
+            Self::ClaudeCache => "CLAUDE CACHE",
         }
     }
 }
@@ -47,6 +54,57 @@ pub struct RateLimitWindow {
 pub struct RateLimitSnapshot {
     pub limit_name: Option<String>,
     pub primary: Option<RateLimitWindow>,
+    /// Size of this limit as a percentage of the all-models weekly limit.
+    pub share_of_weekly: Option<f64>,
+}
+
+/// One grant of limit resets: each reset refills the listed limits at once
+/// without moving the weekly reset day.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResetGrant {
+    pub label: Option<String>,
+    pub resets_left: u32,
+    pub resets_total: u32,
+    /// Unix seconds after which the grant can no longer be used.
+    pub ends_at: Option<i64>,
+    /// Display names of the limits a reset refills.
+    pub clears: Vec<String>,
+    pub paused: bool,
+    pub usable_now: bool,
+    /// A reset can be used only while one of the limits is reached.
+    pub requires_limit: bool,
+}
+
+/// Limit-reset status ("Use your reset" on claude.ai, `/limit-reset` in
+/// Claude Code).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LimitResetStatus {
+    pub eligible: bool,
+    /// Why no reset is offered (for example `no_grant`), as reported.
+    pub ineligible_reason: Option<String>,
+    pub at_limit: bool,
+    pub grants: Vec<ResetGrant>,
+    /// Unix seconds until which no reset can be used.
+    pub cooldown_until: Option<i64>,
+}
+
+impl LimitResetStatus {
+    /// Resets that can still be used, across grants that are not paused.
+    pub fn resets_left(&self) -> u32 {
+        self.grants
+            .iter()
+            .filter(|grant| !grant.paused)
+            .map(|grant| grant.resets_left)
+            .sum()
+    }
+
+    /// The usable grant that expires first.
+    pub fn next_grant(&self) -> Option<&ResetGrant> {
+        self.grants
+            .iter()
+            .filter(|grant| grant.resets_left > 0 && !grant.paused)
+            .min_by_key(|grant| grant.ends_at.unwrap_or(i64::MAX))
+    }
 }
 
 /// Paid usage beyond the subscription limits.
@@ -85,6 +143,10 @@ pub struct AccountRateLimits {
     pub surfaces: Vec<SurfaceShare>,
     /// Name of the limit that currently binds, when the server reports it.
     pub active_limit: Option<String>,
+    pub limit_reset: Option<LimitResetStatus>,
+    /// Set when the scoped limits, extra usage, surfaces, and reset status
+    /// come from Claude Code's cache, captured at this (older) time.
+    pub details_captured_at: Option<i64>,
 }
 
 impl AccountRateLimits {
@@ -100,6 +162,34 @@ impl AccountRateLimits {
             extra_usage: None,
             surfaces: Vec::new(),
             active_limit: None,
+            limit_reset: None,
+            details_captured_at: None,
+        }
+    }
+
+    /// Clears windows whose reset time has passed: the old value no longer
+    /// applies and the new one is unknown. Drops expired reset grants.
+    pub(crate) fn expire(&mut self, now: i64) {
+        let windows = [
+            self.primary.as_mut(),
+            self.secondary.as_mut(),
+            self.spend_limit.as_mut(),
+        ];
+        let buckets = self
+            .buckets
+            .iter_mut()
+            .filter_map(|bucket| bucket.primary.as_mut());
+        for window in windows.into_iter().flatten().chain(buckets) {
+            if window.resets_at.is_some_and(|reset| reset <= now) {
+                window.used_percent = None;
+                window.resets_at = None;
+            }
+        }
+        if let Some(status) = self.limit_reset.as_mut() {
+            status
+                .grants
+                .retain(|grant| grant.ends_at.is_none_or(|ends_at| ends_at > now));
+            status.cooldown_until = status.cooldown_until.filter(|until| *until > now);
         }
     }
 }

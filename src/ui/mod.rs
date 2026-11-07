@@ -732,7 +732,7 @@ fn footer_hint(screen: ActiveScreen) -> &'static str {
             "Activity: Statistic [tab] (tokens/time/runs), Projects [+/-], Scroll [wheel/left/right/PgUp/PgDn/Home/End], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::ApiStat => {
-            "APISTAT: View [v/tab] (limits/models), Dates [d] (all/7d/30d), Copy models [ctrl+s], Refresh limits [r/F5], Switch [s/F2], Help [?], Quit [q]"
+            "APISTAT: View [v/tab] (limits/models), Dates [d] (all/7d/30d), Copy models [ctrl+s], Open claude.ai usage [o], Refresh limits [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::Cost => {
             "Cost: Dates [d] (all/7d/30d), Zone [z on USAGE], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
@@ -3938,6 +3938,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  v/Tab - switch LIMITS / MODELS view"),
             Line::from("  d    - cycle Models dates (all / 7 days / 30 days)"),
             Line::from("  ctrl+s - copy the Models table (terminal clipboard)"),
+            Line::from("  o    - open claude.ai usage settings (limit resets)"),
             Line::from("  r/F5 - refresh live limits"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  c    - cycle color theme; click # to toggle chart fill"),
@@ -4536,19 +4537,20 @@ fn percent_left_value(used_percent: Option<f64>) -> String {
 }
 
 fn resets_label(resets_at: Option<i64>, formatter: DisplayFormatter<'_>) -> Option<String> {
-    let raw = resets_at?;
-    let ms = crate::limits::normalize_epoch_millis(raw);
+    moment_label(resets_at?, formatter).map(|moment| format!("resets {moment}"))
+}
+
+/// Local time of a Unix timestamp, with the date unless it is today.
+fn moment_label(at: i64, formatter: DisplayFormatter<'_>) -> Option<String> {
+    let ms = crate::limits::normalize_epoch_millis(at);
     let dt = Local.timestamp_millis_opt(ms).single()?;
     let today = Local::now().date_naive();
     let day = dt.date_naive();
     let time = formatter.format_time(dt.naive_local());
     if day == today {
-        Some(format!("resets {time}"))
+        Some(time)
     } else {
-        Some(format!(
-            "resets {time}, {}",
-            formatter.format_reset_date(day)
-        ))
+        Some(format!("{time}, {}", formatter.format_reset_date(day)))
     }
 }
 
@@ -4631,7 +4633,33 @@ fn format_limits_compact_card_lines(
         format_rolling_limit_lines(short_window, weekly_window, compact, formatter);
     let extra = format_extra_bucket_compact_line(l, compact, formatter)
         .or_else(|| format_extra_usage_compact_line(l, formatter));
-    (rolling_first, Some(rolling_second), extra, None)
+    let reset = format_limit_reset_compact_line(l, compact, formatter);
+    (rolling_first, Some(rolling_second), extra, reset)
+}
+
+/// Resets that can still be used, with the date the next one expires.
+fn format_limit_reset_compact_line(
+    l: &crate::limits::AccountRateLimits,
+    compact: bool,
+    formatter: DisplayFormatter<'_>,
+) -> Option<String> {
+    let status = l.limit_reset.as_ref()?;
+    let left = status.resets_left();
+    if left == 0 {
+        return None;
+    }
+    let ends_at = status.next_grant().and_then(|grant| grant.ends_at);
+    if compact {
+        let by = reset_compact_label(ends_at, formatter)
+            .map(|value| format!(" | by {value}"))
+            .unwrap_or_default();
+        return Some(format!("Reset: {left}{by}"));
+    }
+    let by = ends_at
+        .and_then(|ends_at| moment_label(ends_at, formatter))
+        .map(|moment| format!(" (use by {moment})"))
+        .unwrap_or_default();
+    Some(format!("{:<10}{left} left{by}", "Reset:"))
 }
 
 const WEEKLY_WINDOW_MINUTES: f64 = 6.0 * 24.0 * 60.0;
@@ -6177,10 +6205,12 @@ mod tests {
                 crate::limits::RateLimitSnapshot {
                     limit_name: Some("Sonnet".to_string()),
                     primary: Some(window(5.0)),
+                    share_of_weekly: None,
                 },
                 crate::limits::RateLimitSnapshot {
                     limit_name: Some("Opus".to_string()),
                     primary: Some(window(40.0)),
+                    share_of_weekly: Some(50.0),
                 },
             ],
             ..crate::limits::AccountRateLimits::empty(crate::limits::LimitsSourceKind::OAuth, 0)
@@ -6191,6 +6221,35 @@ mod tests {
         assert_eq!(value, "5h limit: 90%");
         assert_eq!(caption1.as_deref(), Some("Weekly:   87%"));
         assert_eq!(caption2.as_deref(), Some("Opus:     60%"));
+        assert_eq!(caption3, None);
+
+        // A usable limit reset takes the last line.
+        let grant = |resets_left: u32, paused: bool| crate::limits::ResetGrant {
+            label: None,
+            resets_left,
+            resets_total: 2,
+            ends_at: None,
+            clears: Vec::new(),
+            paused,
+            usable_now: false,
+            requires_limit: true,
+        };
+        let mut limits = limits;
+        limits.limit_reset = Some(crate::limits::LimitResetStatus {
+            eligible: true,
+            ineligible_reason: None,
+            at_limit: false,
+            grants: vec![grant(1, false), grant(1, true)],
+            cooldown_until: None,
+        });
+        let (_, _, _, caption3) = format_limits_compact_card_lines(&limits, false, formatter);
+        assert_eq!(caption3.as_deref(), Some("Reset:    1 left"));
+        let (_, _, _, caption3) = format_limits_compact_card_lines(&limits, true, formatter);
+        assert_eq!(caption3.as_deref(), Some("Reset: 1"));
+        if let Some(status) = limits.limit_reset.as_mut() {
+            status.grants.clear();
+        }
+        let (_, _, _, caption3) = format_limits_compact_card_lines(&limits, false, formatter);
         assert_eq!(caption3, None);
     }
 
