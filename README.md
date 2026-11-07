@@ -91,7 +91,9 @@ never stored or refreshed by claudemon.
   `~/.claudemon/config.json` with `resume_terminal_command` (window) and
   `resume_terminal_tab_command` (tab), for example
   `"gnome-terminal --working-directory={cwd} -- bash -ic {command}"`
-  (`{cwd}`, `{session_id}`, and `{command}` are shell-quoted).
+  (`{cwd}`, `{session_id}`, and `{command}` are shell-quoted). From WSL,
+  Windows Terminal tabs use the distribution's profile (colors, font,
+  icon); set `windows_terminal_profile` to use another profile.
 - **RECENT** - coding-agent sessions used in the last day, week, or month
   (`d`), with whether each one is running now: Claude Code, Codex,
   opencode, and Antigravity (`agy`). Running sessions show their status

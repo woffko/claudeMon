@@ -60,3 +60,6 @@ All notable changes to this project are documented in this file.
   and terminal. A stopped session resumes in a new terminal tab (RUN, `t`)
   or window (Enter) with the agent's own resume command; the list refreshes every 15 seconds
   while shown.
+- Windows Terminal opens resumed sessions with the WSL distribution's
+  visible profile, so they look like the distribution's other tabs;
+  `windows_terminal_profile` in config.json picks another profile.

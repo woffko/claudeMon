@@ -80,9 +80,17 @@ pub enum Launcher {
     /// A new tmux window in the current tmux session (tmux's tab).
     Tmux,
     /// A new Windows Terminal window running the WSL distribution.
-    WindowsTerminalWsl { wt: PathBuf, distro: String },
+    /// `profile` gives the tab its colors, font, and icon.
+    WindowsTerminalWsl {
+        wt: PathBuf,
+        distro: String,
+        profile: Option<String>,
+    },
     /// A new Windows Terminal window on native Windows.
-    WindowsTerminal { wt: PathBuf },
+    WindowsTerminal {
+        wt: PathBuf,
+        profile: Option<String>,
+    },
     /// A new Terminal.app window on macOS.
     MacTerminal,
 }
@@ -90,7 +98,14 @@ pub enum Launcher {
 impl Launcher {
     /// Picks a launcher: the configured templates, then tmux, then Windows
     /// Terminal (from WSL or native Windows), then Terminal.app on macOS.
-    pub fn detect(custom_window: Option<&str>, custom_tab: Option<&str>) -> Option<Self> {
+    /// Windows Terminal opens tabs with `wt_profile`; from WSL it defaults
+    /// to the profile named after the distribution, so a resumed session
+    /// looks like the user's other tabs of that distribution.
+    pub fn detect(
+        custom_window: Option<&str>,
+        custom_tab: Option<&str>,
+        wt_profile: Option<&str>,
+    ) -> Option<Self> {
         let clean = |value: Option<&str>| {
             value
                 .map(str::trim)
@@ -98,6 +113,8 @@ impl Launcher {
                 .map(str::to_string)
         };
         let (window, tab) = (clean(custom_window), clean(custom_tab));
+        // `;` separates Windows Terminal commands, so it cannot be in a name.
+        let profile = clean(wt_profile).filter(|name| !name.contains(';'));
         if window.is_some() || tab.is_some() {
             return Some(Self::Custom { window, tab });
         }
@@ -105,12 +122,22 @@ impl Launcher {
             return Some(Self::Tmux);
         }
         if cfg!(windows) {
-            return find_in_path("wt.exe").map(|wt| Self::WindowsTerminal { wt });
+            return find_in_path("wt.exe").map(|wt| {
+                let profile = profile.map(|name| wt_profile_guid(&wt, &name).unwrap_or(name));
+                Self::WindowsTerminal { wt, profile }
+            });
         }
         if let Ok(distro) = std::env::var("WSL_DISTRO_NAME") {
             if !distro.trim().is_empty() {
                 if let Some(wt) = find_in_path("wt.exe") {
-                    return Some(Self::WindowsTerminalWsl { wt, distro });
+                    let name = profile.unwrap_or_else(|| distro.trim().to_string());
+                    let profile = wt_profile_guid(&wt, &name)
+                        .or_else(|| Some(name).filter(|name| !name.contains(';')));
+                    return Some(Self::WindowsTerminalWsl {
+                        wt,
+                        distro,
+                        profile,
+                    });
                 }
             }
         }
@@ -162,6 +189,18 @@ impl Launcher {
             Placement::Window => "new",
             Placement::Tab => "0",
         };
+        let wt_new_tab = |profile: &Option<String>| {
+            let mut args = vec![
+                "-w".to_string(),
+                wt_window.to_string(),
+                "new-tab".to_string(),
+            ];
+            if let Some(profile) = profile {
+                args.extend(["-p".to_string(), profile.clone()]);
+            }
+            args.extend(["--title".to_string(), title.clone()]);
+            args
+        };
         match self {
             Self::Custom { window, tab } => {
                 let template = match placement {
@@ -193,44 +232,38 @@ impl Launcher {
                     ],
                 )
             }
-            Self::WindowsTerminalWsl { wt, distro } => {
+            Self::WindowsTerminalWsl {
+                wt,
+                distro,
+                profile,
+            } => {
                 let shell = user_shell();
                 let script = shell_script(resume, &shell);
-                (
-                    wt.clone(),
-                    vec![
-                        "-w".to_string(),
-                        wt_window.to_string(),
-                        "new-tab".to_string(),
-                        "--title".to_string(),
-                        title,
-                        "wsl.exe".to_string(),
-                        "-d".to_string(),
-                        distro.clone(),
-                        "--cd".to_string(),
-                        cwd_text,
-                        "--".to_string(),
-                        shell,
-                        "-ic".to_string(),
-                        script,
-                    ],
-                )
+                let mut args = wt_new_tab(profile);
+                args.extend([
+                    "wsl.exe".to_string(),
+                    "-d".to_string(),
+                    distro.clone(),
+                    "--cd".to_string(),
+                    cwd_text,
+                    "--".to_string(),
+                    shell,
+                    "-ic".to_string(),
+                    script,
+                ]);
+                (wt.clone(), args)
             }
-            Self::WindowsTerminal { wt } => (
-                wt.clone(),
-                vec![
-                    "-w".to_string(),
-                    wt_window.to_string(),
-                    "new-tab".to_string(),
-                    "--title".to_string(),
-                    title,
+            Self::WindowsTerminal { wt, profile } => {
+                let mut args = wt_new_tab(profile);
+                args.extend([
                     "-d".to_string(),
                     cwd_text,
                     "cmd".to_string(),
                     "/k".to_string(),
                     resume.text(),
-                ],
-            ),
+                ]);
+                (wt.clone(), args)
+            }
             Self::MacTerminal => {
                 let script = format!("cd {} && {}", sh_quote(&cwd_text), resume.text());
                 (
@@ -394,6 +427,52 @@ fn applescript_escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// GUID of the visible Windows Terminal profile named `name`, from the
+/// settings of the Windows Terminal next to `wt`
+/// (`<LocalAppData>\Microsoft\WindowsApps\wt.exe`). A hidden profile can
+/// have the same name (Windows Terminal keeps the one it generated for a
+/// WSL distribution), so a lookup by name could pick one without the
+/// distribution's colors.
+fn wt_profile_guid(wt: &Path, name: &str) -> Option<String> {
+    const MAX_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
+    let local_app_data = wt.parent()?.parent()?.parent()?;
+    [
+        "Packages/Microsoft.WindowsTerminal_8wekyb3d8bbwe/LocalState/settings.json",
+        "Packages/Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe/LocalState/settings.json",
+        "Microsoft/Windows Terminal/settings.json",
+    ]
+    .iter()
+    .map(|relative| local_app_data.join(relative))
+    .filter(|path| {
+        std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_SETTINGS_BYTES)
+    })
+    .find_map(|path| visible_profile_guid(&std::fs::read_to_string(path).ok()?, name))
+}
+
+/// `profiles.list[].guid` of the first profile named `name` that is not
+/// hidden. Whole-line `//` comments, which the settings file allows, are
+/// skipped.
+fn visible_profile_guid(settings: &str, name: &str) -> Option<String> {
+    let text: Vec<&str> = settings
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect();
+    let value: serde_json::Value = serde_json::from_str(&text.join("\n")).ok()?;
+    let profiles = value.get("profiles")?;
+    profiles
+        .get("list")
+        .unwrap_or(profiles)
+        .as_array()?
+        .iter()
+        .filter(|profile| profile.get("hidden").and_then(serde_json::Value::as_bool) != Some(true))
+        .find(|profile| profile.get("name").and_then(serde_json::Value::as_str) == Some(name))?
+        .get("guid")?
+        .as_str()
+        .filter(|guid| guid.starts_with('{') && !guid.contains(';'))
+        .map(str::to_string)
+}
+
 fn find_in_path(program: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(program))
@@ -422,12 +501,13 @@ mod tests {
         let launcher = Launcher::WindowsTerminalWsl {
             wt: PathBuf::from("/mnt/c/wt.exe"),
             distro: "Ubuntu".to_string(),
+            profile: Some("Ubuntu".to_string()),
         };
         let cwd = Path::new("/home/user/my;app");
         let (program, window) = launcher.command(cwd, &resume(), Placement::Window);
         assert_eq!(program, PathBuf::from("/mnt/c/wt.exe"));
-        assert_eq!(&window[..3], ["-w", "new", "new-tab"]);
-        assert_eq!(window[4], "Claude: myapp");
+        assert_eq!(&window[..5], ["-w", "new", "new-tab", "-p", "Ubuntu"]);
+        assert_eq!(window[6], "Claude: myapp");
         let wsl = window
             .iter()
             .position(|arg| arg == "wsl.exe")
@@ -445,6 +525,38 @@ mod tests {
         assert_eq!(&tab[3..], &window[3..]);
         assert!(launcher.supports(Placement::Window) && launcher.supports(Placement::Tab));
         assert_eq!(launcher.label(Placement::Tab), "a new Windows Terminal tab");
+    }
+
+    #[test]
+    fn the_visible_profile_of_a_name_is_found_in_the_settings() {
+        let settings = r#"{
+            // Windows Terminal writes comments like this one.
+            "defaultProfile": "{00000000-0000-0000-0000-000000000001}",
+            "profiles": {
+                "list": [
+                    {"guid": "{00000000-0000-0000-0000-00000000000a}", "name": "Ubuntu",
+                     "hidden": true, "source": "Windows.Terminal.Wsl"},
+                    {"guid": "{00000000-0000-0000-0000-00000000000b}", "name": "Ubuntu",
+                     "hidden": false, "source": "Microsoft.WSL"}
+                ]
+            }
+        }"#;
+        assert_eq!(
+            visible_profile_guid(settings, "Ubuntu").as_deref(),
+            Some("{00000000-0000-0000-0000-00000000000b}")
+        );
+        assert_eq!(visible_profile_guid(settings, "Debian"), None);
+        assert_eq!(visible_profile_guid("not json", "Ubuntu"), None);
+    }
+
+    #[test]
+    fn windows_terminal_without_a_profile_uses_the_default_one() {
+        let launcher = Launcher::WindowsTerminal {
+            wt: PathBuf::from("wt.exe"),
+            profile: None,
+        };
+        let (_, args) = launcher.command(Path::new("/srv/app"), &resume(), Placement::Tab);
+        assert_eq!(&args[..5], ["-w", "0", "new-tab", "--title", "Claude: app"]);
     }
 
     #[test]
@@ -483,8 +595,8 @@ mod tests {
         assert!(window_only.supports(Placement::Window));
         assert!(!window_only.supports(Placement::Tab));
         assert_eq!(
-            Launcher::detect(Some("  "), Some("")).is_some(),
-            Launcher::detect(None, None).is_some()
+            Launcher::detect(Some("  "), Some(""), None).is_some(),
+            Launcher::detect(None, None, None).is_some()
         );
     }
 

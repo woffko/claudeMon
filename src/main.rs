@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::path::PathBuf;
 
-const USER_CONFIG_SCHEMA_VERSION: u32 = 6;
+const USER_CONFIG_SCHEMA_VERSION: u32 = 7;
 const USER_CONFIG_FILE_NAME: &str = "config.json";
 const DEFAULT_USAGE_DAYS: u32 = 30;
 const DEFAULT_REFRESH_USAGE_SECS: u64 = 300;
@@ -60,6 +60,10 @@ struct UserConfig {
     resume_terminal_command: Option<String>,
     /// Same as `resume_terminal_command`, for opening a new tab.
     resume_terminal_tab_command: Option<String>,
+    /// Windows Terminal profile for resumed sessions (colors, font, icon).
+    /// Default from WSL: the profile named after the distribution; on
+    /// Windows: Windows Terminal's default profile.
+    windows_terminal_profile: Option<String>,
 }
 
 impl Default for UserConfig {
@@ -88,6 +92,7 @@ impl Default for UserConfig {
             pricing_updated: pricing::DEFAULT_PRICING_UPDATED.to_string(),
             resume_terminal_command: None,
             resume_terminal_tab_command: None,
+            windows_terminal_profile: None,
         }
     }
 }
@@ -409,6 +414,7 @@ async fn main() -> Result<()> {
         resume_launcher: launch::Launcher::detect(
             user_config.resume_terminal_command.as_deref(),
             user_config.resume_terminal_tab_command.as_deref(),
+            user_config.windows_terminal_profile.as_deref(),
         ),
         pricing: pricing::PriceTable {
             prices: user_config.pricing.clone(),
