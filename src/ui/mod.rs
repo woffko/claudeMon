@@ -756,7 +756,7 @@ fn footer_hint(screen: ActiveScreen) -> &'static str {
             "Cost: Dates [d] (all/7d/30d), Zone [z on USAGE], Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::Recent => {
-            "Recent: Select [up/down/wheel/click], Open stopped session [RUN/t: new tab, Enter/double-click: new window], Copy command [y], Dates [d] (day/week/month), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
+            "Recent: Select [up/down/wheel/click], Open stopped session [RUN/t: new tab, Enter/double-click: new window], Copy command [y], Dates [d] (day/week/month/all), Refresh [r/F5], Switch [s/F2], Help [?], Quit [q]"
         }
         ActiveScreen::Read => "",
     }
@@ -3985,7 +3985,7 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect, screen: ActiveScreen) 
             Line::from("  RUN, t - resume a stopped session in a new tab (a window without tabs)"),
             Line::from("  Enter, double-click - resume it in a new window"),
             Line::from("  y    - copy the resume command"),
-            Line::from("  d    - cycle dates (day / week / month)"),
+            Line::from("  d    - cycle dates (day / week / month / all)"),
             Line::from("  r/F5 - refresh now (otherwise every 15 s while shown)"),
             Line::from("  n    - cycle display style (Classic/System Compact/Full)"),
             Line::from("  c    - cycle color theme"),

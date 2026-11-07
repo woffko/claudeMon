@@ -5,12 +5,12 @@
 
 use super::{
     directory_name, open_read_only, proc, short_title, unmatched_state, Agent, LiveProcess,
-    RecentSession, SessionState, MAX_AGE_SECS,
+    RecentSession, SessionState, MAX_SESSIONS_PER_AGENT,
 };
 use crate::launch::ResumeCommand;
 use std::path::{Path, PathBuf};
 
-pub(crate) fn scan(agy_dir: &Path, now: i64) -> Vec<RecentSession> {
+pub(crate) fn scan(agy_dir: &Path) -> Vec<RecentSession> {
     let Some(connection) = open_read_only(&agy_dir.join("conversation_summaries.db")) else {
         return Vec::new();
     };
@@ -18,11 +18,11 @@ pub(crate) fn scan(agy_dir: &Path, now: i64) -> Vec<RecentSession> {
     let Ok(mut statement) = connection.prepare(
         "SELECT conversation_id, title, preview, last_modified_time, workspace_uris, status \
          FROM conversation_summaries WHERE nesting_depth IS NULL OR nesting_depth = 0 \
-         ORDER BY last_modified_time DESC LIMIT 1000",
+         ORDER BY last_modified_time DESC LIMIT ?1",
     ) else {
         return Vec::new();
     };
-    let rows = statement.query_map([], |row| {
+    let rows = statement.query_map([MAX_SESSIONS_PER_AGENT as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -54,9 +54,6 @@ pub(crate) fn scan(agy_dir: &Path, now: i64) -> Vec<RecentSession> {
                 }),
                 None => unmatched_state(),
             };
-            if last_active < now - MAX_AGE_SECS && !matches!(state, SessionState::Running(_)) {
-                return None;
-            }
             let title = title
                 .as_deref()
                 .and_then(short_title)
@@ -111,11 +108,14 @@ fn lock_holder(
     None
 }
 
-/// `2026-11-06 18:29:23.475681611+00:00` as Unix seconds.
+/// `2026-11-06 18:29:23.475681611+00:00` (the fraction may be missing) as
+/// Unix seconds.
 fn parse_time(text: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_str(text.trim(), "%Y-%m-%d %H:%M:%S%.f%:z")
-        .or_else(|_| chrono::DateTime::parse_from_rfc3339(text.trim()))
-        .ok()
+    let text = text.trim();
+    ["%Y-%m-%d %H:%M:%S%.f%:z", "%Y-%m-%d %H:%M:%S%:z"]
+        .iter()
+        .find_map(|format| chrono::DateTime::parse_from_str(text, format).ok())
+        .or_else(|| chrono::DateTime::parse_from_rfc3339(text).ok())
         .map(|parsed| parsed.timestamp())
 }
 
@@ -163,6 +163,8 @@ mod tests {
             parse_time("2001-09-09 01:46:40.475681611+00:00"),
             Some(1_000_000_000)
         );
+        assert_eq!(parse_time("2001-09-09 01:46:40+00:00"), Some(1_000_000_000));
+        assert_eq!(parse_time("yesterday"), None);
         assert_eq!(
             first_workspace(r#"["file:///home/user/my%20app", "file:///other"]"#),
             Some(PathBuf::from("/home/user/my app"))
@@ -200,7 +202,7 @@ mod tests {
             .expect("schema");
         drop(connection);
 
-        let sessions = scan(&dir, 1_000_000_100);
+        let sessions = scan(&dir);
         assert_eq!(sessions.len(), 1, "{sessions:?}");
         let session = &sessions[0];
         assert_eq!(session.agent, Agent::Antigravity);

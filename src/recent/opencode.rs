@@ -5,7 +5,7 @@
 
 use super::{
     directory_name, flag_value, mark_running, open_read_only, proc, short_title, unmatched_state,
-    Agent, RecentSession, MAX_AGE_SECS,
+    Agent, RecentSession, MAX_SESSIONS_PER_AGENT,
 };
 use crate::launch::ResumeCommand;
 use std::path::{Path, PathBuf};
@@ -13,19 +13,19 @@ use std::path::{Path, PathBuf};
 /// Subcommands that are not an interactive session.
 const NON_INTERACTIVE: [&str; 6] = ["run", "serve", "acp", "web", "mcp", "auth"];
 
-pub(crate) fn scan(db: &Path, now: i64) -> Vec<RecentSession> {
+pub(crate) fn scan(db: &Path) -> Vec<RecentSession> {
     let Some(connection) = open_read_only(db) else {
         return Vec::new();
     };
     // Top-level sessions only: subagent sessions have a parent.
     let Ok(mut statement) = connection.prepare(
         "SELECT id, directory, title, time_created, time_updated FROM session \
-         WHERE parent_id IS NULL AND time_archived IS NULL AND time_updated >= ?1 \
-         ORDER BY time_updated DESC LIMIT 500",
+         WHERE parent_id IS NULL AND time_archived IS NULL \
+         ORDER BY time_updated DESC LIMIT ?1",
     ) else {
         return Vec::new();
     };
-    let rows = statement.query_map([(now - MAX_AGE_SECS) * 1000], |row| {
+    let rows = statement.query_map([MAX_SESSIONS_PER_AGENT as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -106,7 +106,7 @@ mod tests {
             .expect("schema");
         drop(connection);
 
-        let sessions = scan(&db, 2_000_000_000);
+        let sessions = scan(&db);
         assert_eq!(sessions.len(), 1, "{sessions:?}");
         assert_eq!(sessions[0].name, "Plan the release");
         assert_eq!(sessions[0].cwd.as_deref(), Some(Path::new("/work/app")));

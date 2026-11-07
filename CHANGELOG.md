@@ -63,3 +63,4 @@ All notable changes to this project are documented in this file.
 - Windows Terminal opens resumed sessions with the WSL distribution's
   visible profile, so they look like the distribution's other tabs;
   `windows_terminal_profile` in config.json picks another profile.
+- RECENT has an ALL period next to DAY / WEEK / MONTH.

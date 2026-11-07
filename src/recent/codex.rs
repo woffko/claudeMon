@@ -5,7 +5,7 @@
 
 use super::{
     directory_name, mark_running, open_read_only, proc, short_title, unmatched_state, Agent,
-    RecentSession, MAX_AGE_SECS,
+    RecentSession, MAX_SESSIONS_PER_AGENT,
 };
 use crate::launch::ResumeCommand;
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ const NON_INTERACTIVE: [&str; 9] = [
     "sandbox",
 ];
 
-pub(crate) fn scan(codex_home: &Path, now: i64) -> Vec<RecentSession> {
+pub(crate) fn scan(codex_home: &Path) -> Vec<RecentSession> {
     let Some(connection) = latest_state_db(codex_home).and_then(|db| open_read_only(&db)) else {
         return Vec::new();
     };
@@ -32,12 +32,12 @@ pub(crate) fn scan(codex_home: &Path, now: i64) -> Vec<RecentSession> {
     let Ok(mut statement) = connection.prepare(
         "SELECT id, cwd, name, title, created_at_ms, updated_at_ms FROM threads \
          WHERE archived = 0 AND source IN ('cli', 'vscode') \
-         AND (thread_source IS NULL OR thread_source = 'user') AND updated_at_ms >= ?1 \
-         ORDER BY updated_at_ms DESC LIMIT 500",
+         AND (thread_source IS NULL OR thread_source = 'user') \
+         ORDER BY updated_at_ms DESC LIMIT ?1",
     ) else {
         return Vec::new();
     };
-    let rows = statement.query_map([(now - MAX_AGE_SECS) * 1000], |row| {
+    let rows = statement.query_map([MAX_SESSIONS_PER_AGENT as i64], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, Option<String>>(1)?,
@@ -165,8 +165,13 @@ mod tests {
             .expect("schema");
         drop(connection);
 
-        let sessions = scan(&dir, 2_000_000_000);
-        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        let sessions = scan(&dir);
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["t-cli", "t-old"],
+            "newest first; subagent and exec threads left out"
+        );
         let session = &sessions[0];
         assert_eq!(session.agent, Agent::Codex);
         assert_eq!(session.name, "refactor");

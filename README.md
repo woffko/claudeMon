@@ -94,8 +94,8 @@ never stored or refreshed by claudemon.
   (`{cwd}`, `{session_id}`, and `{command}` are shell-quoted). From WSL,
   Windows Terminal tabs use the distribution's profile (colors, font,
   icon); set `windows_terminal_profile` to use another profile.
-- **RECENT** - coding-agent sessions used in the last day, week, or month
-  (`d`), with whether each one is running now: Claude Code, Codex,
+- **RECENT** - coding-agent sessions used in the last day, week, month, or
+  all time (`d`), with whether each one is running now: Claude Code, Codex,
   opencode, and Antigravity (`agy`). Running sessions show their status
   (busy / idle / waiting / shell for Claude Code), PID, and terminal; a
   stopped one has a RUN button. RUN or `t` resumes it in a new terminal tab

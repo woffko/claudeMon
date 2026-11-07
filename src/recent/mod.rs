@@ -13,9 +13,8 @@ use crate::launch::ResumeCommand;
 use proc::ProcessInfo;
 use std::path::{Path, PathBuf};
 
-/// Sessions last active within this many seconds are listed (the longest
-/// range on the screen); running sessions are always listed.
-pub(crate) const MAX_AGE_SECS: i64 = 31 * 86_400;
+/// At most this many sessions are read from each agent's index.
+pub(crate) const MAX_SESSIONS_PER_AGENT: usize = 2000;
 
 /// A summary read longer ago than this is read again when its file changes.
 /// Titles change rarely, and a running session's file changes constantly.
@@ -111,18 +110,18 @@ impl Scanner {
         }
     }
 
-    /// Sessions active within `MAX_AGE_SECS` of `now` plus running ones,
-    /// most recently active first. Blocking.
+    /// Every session found, most recently active first; the screen filters
+    /// them by period. Blocking.
     pub(crate) fn scan(&mut self, now: i64) -> Vec<RecentSession> {
         let mut sessions = self.claude.scan(now);
         if let Some(home) = self.codex_home.as_deref() {
-            sessions.extend(codex::scan(home, now));
+            sessions.extend(codex::scan(home));
         }
         if let Some(db) = self.opencode_db.as_deref() {
-            sessions.extend(opencode::scan(db, now));
+            sessions.extend(opencode::scan(db));
         }
         if let Some(dir) = self.agy_dir.as_deref() {
-            sessions.extend(agy::scan(dir, now));
+            sessions.extend(agy::scan(dir));
         }
         sessions.sort_by(|left, right| {
             right

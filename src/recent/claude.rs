@@ -7,8 +7,7 @@
 //! never opened.
 
 use super::{
-    directory_name, proc, Agent, LiveProcess, RecentSession, SessionState, MAX_AGE_SECS,
-    SUMMARY_REFRESH_SECS,
+    directory_name, proc, Agent, LiveProcess, RecentSession, SessionState, SUMMARY_REFRESH_SECS,
 };
 use crate::launch::ResumeCommand;
 use serde::Deserialize;
@@ -23,6 +22,9 @@ const MAX_REGISTRY_FILE_BYTES: u64 = 64 * 1024;
 /// cwd, entrypoint) and the end (the latest title records) are read.
 const HEAD_BYTES: u64 = 256 * 1024;
 const TAIL_BYTES: u64 = 1024 * 1024;
+/// Transcripts untouched for longer than this are read from the start only:
+/// their title is usually there, and an old history can hold many of them.
+const TAIL_WINDOW_SECS: i64 = 31 * 86_400;
 const MAX_TITLE_CHARS: usize = 96;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,7 +88,7 @@ impl ClaudeReader {
 
     pub(crate) fn scan(&mut self, now: i64) -> Vec<RecentSession> {
         let registry = read_registry(&self.claude_dir.join("sessions"));
-        let files = list_transcripts(&self.claude_dir.join("projects"), now - MAX_AGE_SECS);
+        let files = list_transcripts(&self.claude_dir.join("projects"));
         let mut sessions = Vec::new();
         let mut listed = HashSet::new();
         for (path, len, modified) in &files {
@@ -131,7 +133,7 @@ impl ClaudeReader {
                 return cached.info.clone();
             }
         }
-        let info = read_transcript_info(path, len);
+        let info = read_transcript_info(path, len, modified >= now - TAIL_WINDOW_SECS);
         self.transcripts.insert(
             path.to_path_buf(),
             CachedTranscript {
@@ -201,7 +203,7 @@ fn session(
 }
 
 /// Session metadata from the start and the end of a transcript.
-fn read_transcript_info(path: &Path, len: u64) -> Option<TranscriptInfo> {
+fn read_transcript_info(path: &Path, len: u64, read_tail: bool) -> Option<TranscriptInfo> {
     let mut file = std::fs::File::open(path).ok()?;
     let mut head = Vec::new();
     file.by_ref().take(HEAD_BYTES).read_to_end(&mut head).ok()?;
@@ -235,7 +237,7 @@ fn read_transcript_info(path: &Path, len: u64) -> Option<TranscriptInfo> {
         }
         titles.observe(&value);
     }
-    if !head_complete {
+    if !head_complete && read_tail {
         let start = len.saturating_sub(TAIL_BYTES).max(HEAD_BYTES);
         file.seek(SeekFrom::Start(start)).ok()?;
         let mut tail = Vec::new();
@@ -362,9 +364,9 @@ fn read_registry(dir: &Path) -> HashMap<String, Registered> {
     sessions
 }
 
-/// Top-level transcripts (`<projects>/<project>/<session-id>.jsonl`)
-/// modified at or after `since`, with their size and modification time.
-fn list_transcripts(projects: &Path, since: i64) -> Vec<(PathBuf, u64, i64)> {
+/// Top-level transcripts (`<projects>/<project>/<session-id>.jsonl`), with
+/// their size and modification time.
+fn list_transcripts(projects: &Path) -> Vec<(PathBuf, u64, i64)> {
     let mut files = Vec::new();
     let Ok(projects) = std::fs::read_dir(projects) else {
         return files;
@@ -393,9 +395,7 @@ fn list_transcripts(projects: &Path, since: i64) -> Vec<(PathBuf, u64, i64)> {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|duration| duration.as_secs() as i64)
                 .unwrap_or(0);
-            if modified >= since {
-                files.push((path, meta.len(), modified));
-            }
+            files.push((path, meta.len(), modified));
         }
     }
     files

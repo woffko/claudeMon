@@ -69,6 +69,7 @@ fn render_controls(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
         (" DAY ", RecentRange::Day),
         (" WEEK ", RecentRange::Week),
         (" MONTH ", RecentRange::Month),
+        (" ALL ", RecentRange::All),
     ] {
         segments.push((label, Some(UiClickAction::SetRecentRange(range))));
         spans.push(pill(range.pill_label(), state.recent_range == range));
@@ -247,7 +248,10 @@ fn render_list(frame: &mut Frame<'_>, area: Rect, state: &mut AppState) {
             let message = if state.recent_scanned_at.is_none() {
                 "Scanning sessions...".to_string()
             } else {
-                format!("No sessions in the {}.", state.recent_range.label())
+                match state.recent_range {
+                    RecentRange::All => "No sessions found.".to_string(),
+                    range => format!("No sessions in the {}.", range.label()),
+                }
             };
             frame.render_widget(
                 Paragraph::new(Span::styled(message, Style::default().fg(Color::Gray))),
@@ -329,10 +333,14 @@ fn row_line(
                 base,
             ),
             Column::LastActive => (
-                format!(
-                    "{} ago",
-                    format_age(now.saturating_sub(session.last_active))
-                ),
+                if session.last_active > 0 {
+                    format!(
+                        "{} ago",
+                        format_age(now.saturating_sub(session.last_active))
+                    )
+                } else {
+                    "--".to_string()
+                },
                 base.fg(Color::Gray),
             ),
             Column::Started => (

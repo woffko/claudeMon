@@ -149,6 +149,7 @@ pub(crate) enum RecentRange {
     Day,
     Week,
     Month,
+    All,
 }
 
 impl RecentRange {
@@ -156,15 +157,18 @@ impl RecentRange {
         match self {
             Self::Day => Self::Week,
             Self::Week => Self::Month,
-            Self::Month => Self::Day,
+            Self::Month => Self::All,
+            Self::All => Self::Day,
         }
     }
 
-    pub(crate) fn secs(self) -> i64 {
+    /// Length of the period, or `None` for all sessions.
+    pub(crate) fn secs(self) -> Option<i64> {
         match self {
-            Self::Day => 86_400,
-            Self::Week => 7 * 86_400,
-            Self::Month => 30 * 86_400,
+            Self::Day => Some(86_400),
+            Self::Week => Some(7 * 86_400),
+            Self::Month => Some(30 * 86_400),
+            Self::All => None,
         }
     }
 
@@ -173,6 +177,7 @@ impl RecentRange {
             Self::Day => "DAY",
             Self::Week => "WEEK",
             Self::Month => "MONTH",
+            Self::All => "ALL",
         }
     }
 
@@ -181,6 +186,7 @@ impl RecentRange {
             Self::Day => "last 24 hours",
             Self::Week => "last 7 days",
             Self::Month => "last 30 days",
+            Self::All => "all time",
         }
     }
 
@@ -189,6 +195,7 @@ impl RecentRange {
             Self::Day => "day",
             Self::Week => "week",
             Self::Month => "month",
+            Self::All => "all",
         }
     }
 
@@ -197,6 +204,7 @@ impl RecentRange {
             "day" => Some(Self::Day),
             "week" => Some(Self::Week),
             "month" => Some(Self::Month),
+            "all" => Some(Self::All),
             _ => None,
         }
     }
@@ -1827,10 +1835,12 @@ impl AppState {
     /// RECENT sessions in the selected range (running ones always), in
     /// display order.
     pub(crate) fn visible_recent_sessions(&self, now: i64) -> Vec<&RecentSession> {
-        let since = now - self.recent_range.secs();
+        let since = self.recent_range.secs().map(|secs| now - secs);
         self.recent_sessions
             .iter()
-            .filter(|session| session.is_running() || session.last_active >= since)
+            .filter(|session| {
+                session.is_running() || since.is_none_or(|since| session.last_active >= since)
+            })
             .collect()
     }
 
